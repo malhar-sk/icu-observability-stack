@@ -1,6 +1,6 @@
 # Validation report
 
-Three runs. Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+Four runs. Run D tested the `./fleet` helper (see its own section below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
 **Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
 commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
 the server over the network**; see the items marked PARTIAL and the "Not validated" list.
@@ -68,6 +68,33 @@ Footprint. Server: 587 MB download for the three arm64 images (from registry met
 installed, about 43 MB RAM resident (measured on x86, not on a Pi). The 587 MB is paid once, on the
 server, not per device.
 
+## Run D: the `./fleet` helper (x86_64, real Docker stack, run by an AI agent)
+
+Tested against the real containers from empty volumes, not only against fakes. Images were already
+cached on this machine, so no large download happened. **Not run on the Raspberry Pi.**
+
+| Check | Result | Evidence |
+|---|---|---|
+| `./fleet up` from empty volumes | PASS | Three services reported ready, then the dashboard URL, login and device address were printed. 67 s cold (including Grafana's first start), 3 s when re-run on existing volumes. |
+| `./fleet add <id>` waits for a device | PASS | Started in the background, then the agent was started: detected as online 16 s after the agent started, exit 0. |
+| `./fleet list`, `check`, `status`, `list --json` | PASS | Correct states and readings for two live devices; `status` exit 0 when healthy, 1 when not. |
+| Offline detection from the CLI | PASS | `demo-pi-2` stopped: OFFLINE in `./fleet list` after 38 s, the same rule as the dashboard. After a minute its readings show `-`, like the dashboard's N/A. |
+| `./fleet remove` refuses a live device | PASS | `remove demo-pi-1 --yes` while it reported: error, exit 1, nothing deleted. |
+| `./fleet remove` on an offline device | PASS | 0 series left for that device (both selectors), the other device's 4 series untouched, gone from `list`. Its firing alert disappeared within 20 s (sampled every 10 s). |
+| `./fleet down`, answer `n` | PASS | "Aborted. Nothing was changed." exit 1, stack still up. Run in a real pseudo-terminal. |
+| `./fleet down`, answer `y` | PASS | Warned that 1 device was online, stopped, "3 container(s) removed", 0 containers left, both data volumes kept. |
+| `./fleet down` twice | PASS | Second run: "Nothing to stop", exit 0. |
+| `./fleet down --wipe` | PASS | Wrong confirmation word aborted with volumes intact. Right word deleted both volumes (0 left) and all containers. |
+| No terminal and no `--yes` | PASS | Refuses with "re-run with --yes" instead of hanging. |
+| Data survives down and up | PASS | The device and its history were still there after `./fleet up`. |
+| Running agent resumes by itself | PASS, short outage only | A new sample arrived after the stack returned, with no agent restart; its log showed `UNAVAILABLE, retrying` then recovery. The outage was roughly half a minute; a long outage was not tested. |
+| First-run download notice | PARTIAL | The missing-image detection was tested for real (it reports an absent image) but the notice was not seen end to end, since the images were cached. |
+| Unit tests | PASS | `tests/test_fleet.py`: 32 tests with a fake VictoriaMetrics server and patched Docker calls; with the 33 agent tests, 65 pass. |
+
+Bugs the live run found that the fake-server tests missed, all fixed: stray spaces and a `\r` written
+into non-terminal output, a trailing space after the last table column, and "not answering" printed for
+services that did not exist.
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -133,6 +160,8 @@ rendered dashboard; that was checked separately with screenshots.
 
 - A separate device pushing to the server over the network (port 4317 from another machine), or any firewall behaviour.
 - 32-bit Raspberry Pi OS, Pi Zero-class hardware, and ESP32-class devices (the agent is Linux-only; an HTTP path to port 4318 worked in a `curl` test only).
+- `./fleet` on the Raspberry Pi, `./fleet remove --force` on a live device (unit-tested only), and `./fleet add` driving a real remote device.
+- Agents resuming after a long outage of the stack (only about half a minute was tested).
 - A person following the README cold, without step-by-step help.
 - The alert returning to Normal on the Pi (seen only on x86).
 - Notification delivery (none is configured).

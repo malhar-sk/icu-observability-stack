@@ -18,7 +18,7 @@ VictoriaMetrics and Grafana.
 ### Prerequisites
 
 - Docker with Compose v2 (`docker compose version` must work) and permission to run it
-- Python 3.9 or newer with `venv` (on Debian / Raspberry Pi OS: `sudo apt install python3-venv`)
+- Python 3.9 or newer with `venv` (runs both `./fleet` and the device agent; on Debian / Raspberry Pi OS: `sudo apt install python3-venv`)
 - Free ports on the machine that runs the stack:
 
 | Port | Used by |
@@ -28,20 +28,46 @@ VictoriaMetrics and Grafana.
 | 4318 | OpenTelemetry Collector, OTLP HTTP (published, not used by the agent) |
 | 8428 | VictoriaMetrics (storage and query API) |
 
-### 1. Launch the stack and install the agent
+### Commands at a glance
+
+One helper, `./fleet`, runs everything below. Use it on the machine that hosts the stack:
+
+| Command | What it does |
+|---|---|
+| `./fleet up` | Start everything, wait until it is ready, print the dashboard address |
+| `./fleet down` | Stop everything. **Asks first** and confirms afterwards. `--wipe` also deletes stored data |
+| `./fleet status` | Is the stack healthy, and how many devices are online |
+| `./fleet list` | Every device: state, last seen, CPU, memory, disk, temperature, uptime (`--json` for scripts) |
+| `./fleet check <id>` | One device in detail |
+| `./fleet add <id>` | Onboard a device: prints what to run on it and waits until it appears |
+| `./fleet remove <id>` | Forget a retired device (deletes its stored data, asks first) |
+
+It is a thin wrapper around `docker compose` and the stack's own APIs, so the plain commands still
+work; they are listed [at the end of this section](#without-the-helper).
+
+### 1. Start the stack
 
 ```bash
 git clone https://github.com/malhar-sk/icu-observability-stack.git
 cd icu-observability-stack
 
-docker compose up -d
-
-python3 -m venv .venv && . .venv/bin/activate && pip install -r agent/requirements.txt
+./fleet up
 ```
+
+`./fleet up` starts the three services, waits until each answers, then prints the dashboard address,
+the login, and the address devices report to. The **first run downloads about 590 MB** of Docker
+images (mostly Grafana), so avoid a metered connection such as a phone hotspot.
 
 ### 2. Run two devices (two terminals)
 
-Both terminals need the venv (`. .venv/bin/activate`) and must be in the repository directory.
+Both "devices" are this machine here; what tells them apart is the `--device-id`. In the repository
+folder, once:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate && pip install -r agent/requirements.txt
+```
+
+Then in two terminals (each needs `. .venv/bin/activate` first):
 
 ```bash
 # terminal 1
@@ -52,7 +78,10 @@ python agent/device_agent.py --device-id demo-pi-2
 ```
 
 Each agent logs a few startup lines and then runs quietly, pushing every 5 seconds.
-Both demo "devices" are the same machine here; what tells them apart is the `--device-id`.
+
+**For a real, separate device use `./fleet add kitchen-pi` instead.** It checks the ID is free, prints
+the exact copy-and-run commands with this machine's address filled in, and waits until the device
+shows up. See [Monitoring a real remote Raspberry Pi](#monitoring-a-real-remote-raspberry-pi).
 
 ### 3. Open the dashboard
 
@@ -65,12 +94,20 @@ without a sensor then show "N/A" in it. If no device has a sensor, as on many VM
 simply not shown. The graphs below the table need a little longer than the table to fill in (they
 showed "No data" 17 s after start and had lines about 30 s in).
 
-### 4. Simulate a device going offline
+### 4. Check on your devices
+
+```bash
+./fleet list              # state, last seen and readings for every device
+./fleet check demo-pi-2   # one device in detail
+```
+
+### 5. Simulate a device going offline
 
 Press **Ctrl+C** in the `demo-pi-2` terminal.
 
 - **Within roughly 30 to 40 seconds** the `demo-pi-2` row switches to **OFFLINE** (a device is
-  offline when it has not reported for more than 30 s). `demo-pi-1` stays ONLINE.
+  offline when it has not reported for more than 30 s), and `./fleet list` shows the same.
+  `demo-pi-1` stays ONLINE.
 - In Grafana go to **Alerting, then Alert rules**, expand the folder **Device Fleet** and the group
   `device-health`, and click **DeviceOffline**. The **Instances** tab (and the Threshold table at the
   bottom of the page) lists one instance per device. `demo-pi-2` goes **Pending** and then **Firing**
@@ -78,11 +115,37 @@ Press **Ctrl+C** in the `demo-pi-2` terminal.
 - Start `demo-pi-2` again: it returns to ONLINE and the alert instance goes back to Normal
   within roughly 20 s (the rule is evaluated every 10 s).
 
-### 5. Stop the stack
+### 6. Retire a device
+
+A device that is gone for good stays on the dashboard as OFFLINE for a day, and keeps its alert. Stop
+its agent, then:
 
 ```bash
-docker compose down        # stops the containers, keeps stored metrics and Grafana state
-docker compose down -v     # ALSO DELETES all stored metrics and Grafana state
+./fleet remove demo-pi-2
+```
+
+It asks first, then deletes that device's stored data. The device is gone from the dashboard table
+and `./fleet list` at once, and its alert cleared in under 20 s in testing. `remove` refuses a device
+that is reporting right now unless you add `--force` (it comes back on its next report).
+
+### 7. Stop the stack
+
+```bash
+./fleet down            # asks first; stops everything, keeps stored metrics and Grafana state
+./fleet down --wipe     # ALSO DELETES all stored metrics and Grafana state (asks twice)
+```
+
+Devices keep running and retry while the stack is down. After a short outage (about half a minute,
+the only length tested) they resumed by themselves once `./fleet up` was back.
+
+### Without the helper
+
+`./fleet` only wraps these, so you can always run them directly:
+
+```bash
+docker compose up -d       # = ./fleet up, without waiting for readiness
+docker compose down        # = ./fleet down, without asking
+docker compose down -v     # = ./fleet down --wipe, without asking: ALSO DELETES stored data
 ```
 
 ### Check everything automatically
@@ -126,7 +189,10 @@ Metrics pushed (all gauges, each labelled `device_id` and `hostname`): `device_c
 
 ### Monitoring a real remote Raspberry Pi
 
-1. On the server, run `docker compose up -d` and find its IP address (for example `192.168.1.10`).
+The shortcut: on the server run `./fleet add garage-pi`. It checks the ID is free, prints the commands
+below with the server's address filled in, and waits until the device appears. The manual steps:
+
+1. On the server, run `./fleet up` and find its IP address (for example `192.168.1.10`).
 2. Make sure the Pi can reach the server on **TCP 4317** (check any firewall). From the Pi, this
    prints `reachable` or fails with an error:
    `python3 -c "import socket; socket.create_connection(('192.168.1.10', 4317), 3); print('reachable')"`
@@ -161,6 +227,7 @@ Wait about 10 seconds first (VictoriaMetrics is configured to hide the newest 5 
 agent pushes every 5 s). Then check, in this order:
 
 ```bash
+./fleet status                             # one-glance health of the stack, plus how many devices are online
 docker compose ps                          # victoriametrics, otel-collector and grafana should all be "Up"
 curl localhost:8428/health                 # prints OK
 docker compose logs otel-collector         # look for errors exporting to VictoriaMetrics
@@ -240,7 +307,8 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 ## Known limitations
 
 - **No authentication or TLS** anywhere: agents send plaintext gRPC and anyone who can reach port 4317 can inject data. Grafana uses `admin` / `admin`.
-- **No device registry.** A device that has never reported is invisible, and a device silent for more than a day drops off the dashboard.
+- **No device registry.** A device that has never reported is invisible, and a device silent for more than a day drops off the dashboard. That is why `./fleet add` cannot "create" a device on the server: a device exists once it reports.
+- **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there, and agents do not start at boot. `./fleet` was tested on x86_64 Linux; it has not been run on the Raspberry Pi.
 - **No notifications.** No contact point is configured, so an alert is visible only inside Grafana (and its API).
 - **Offline detection is not instant.** It needs a push every 5 s and takes about a minute from the device stopping to the alert firing.
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
