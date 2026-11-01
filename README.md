@@ -62,7 +62,8 @@ password; you can skip that). The **Device Fleet** dashboard opens as the home p
 state (ONLINE / OFFLINE), last seen, CPU %, memory %, disk % and uptime. A **temperature** column
 appears as soon as any device reports one (a Raspberry Pi does, via `/sys/class/thermal`); devices
 without a sensor then show "N/A" in it. If no device has a sensor, as on many VMs, the column is
-simply not shown.
+simply not shown. The graphs below the table need a little longer than the table to fill in (they
+showed "No data" 17 s after start and had lines about 30 s in).
 
 ### 4. Simulate a device going offline
 
