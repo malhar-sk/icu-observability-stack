@@ -31,7 +31,7 @@ VictoriaMetrics and Grafana.
 ### 1. Launch the stack and install the agent
 
 ```bash
-git clone https://github.com/jaimalharsk/icu-observability-stack.git
+git clone https://github.com/malhar-sk/icu-observability-stack.git
 cd icu-observability-stack
 
 docker compose up -d
@@ -85,7 +85,7 @@ docker compose down -v     # ALSO DELETES all stored metrics and Grafana state
 
 `scripts/validate.sh` runs the whole scenario above without a browser: it starts the stack, runs two
 agents, checks both devices appear, stops one, and waits for it to be OFFLINE and for the
-`DeviceOffline` alert to fire for that device only. It takes a few minutes, exits non-zero on any
+`DeviceOffline` alert to fire for that device only. It takes about three minutes, exits non-zero on any
 failure, and leaves the stack running unless you pass `--down`.
 
 ```bash
@@ -110,7 +110,9 @@ The agent reads flags first, then environment variables, then defaults.
 | Path whose disk usage is reported | `--disk-path` | `DISK_PATH` | `/` |
 | Print one JSON snapshot and exit, sending nothing | `--dry-run` | | off |
 
-Try `python agent/device_agent.py --dry-run` first to see what a device would report.
+Try `python agent/device_agent.py --dry-run` first to see what a device would report. An example
+environment file is in `agent/device-agent.env.example` (load it with
+`set -a; . agent/device-agent.env.example; set +a`).
 
 Metrics pushed (all gauges, each labelled `device_id` and `hostname`): `device_cpu_utilization_percent`,
 `device_memory_utilization_percent`, `device_disk_utilization_percent`, `device_uptime_seconds` and
@@ -121,8 +123,9 @@ Metrics pushed (all gauges, each labelled `device_id` and `hostname`): `device_c
 ### Monitoring a real remote Raspberry Pi
 
 1. On the server, run `docker compose up -d` and find its IP address (for example `192.168.1.10`).
-2. Make sure the Pi can reach the server on **TCP 4317** (check any firewall; from the Pi,
-   `nc -vz 192.168.1.10 4317`).
+2. Make sure the Pi can reach the server on **TCP 4317** (check any firewall). From the Pi, this
+   prints `reachable` or fails with an error:
+   `python3 -c "import socket; socket.create_connection(('192.168.1.10', 4317), 3); print('reachable')"`
 3. Copy `agent/device_agent.py` and `agent/requirements.txt` to the Pi, create a venv and install
    the requirements (same commands as the quickstart).
 4. Run it with an endpoint and a **distinct, stable** device ID:
@@ -155,7 +158,7 @@ curl -s 'localhost:8428/api/v1/query?query=device_uptime_seconds'   # your devic
 ```
 
 On a remote device, also check that the `--endpoint` is `host:port` (not `https://`), that the server
-IP is right, and that TCP 4317 is reachable (`nc -vz <server-ip> 4317`).
+IP is right, and that TCP 4317 is reachable (the Python one-liner in the remote-device steps above).
 
 **The dashboard is empty or shows "No data".**
 Confirm the query above returns your device. Then in Grafana open Connections, Data sources,
