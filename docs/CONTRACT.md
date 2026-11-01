@@ -46,7 +46,9 @@ append a suffix. Units are part of the name. Every data point carries the labels
 Rules:
 
 - **Unavailable sensor means no data point at all.** Never emit 0 or NaN as a
-  placeholder. Today only temperature can be absent. The dashboard shows "N/A".
+  placeholder. Today only temperature can be absent. In the fleet table a device
+  without a reading shows "N/A" once at least one device reports a temperature;
+  if none does, the temperature column is not shown.
 - **Liveness metric is `device_uptime_seconds`.** It is always emitted, so it
   defines "last seen". Every other metric may be missing.
 - Use **observable gauges with callbacks** so a fresh sample is produced on
@@ -87,7 +89,7 @@ Flag beats env var beats default. A leading `http://` on the endpoint is tolerat
 | Dashboard | uid `device-fleet`, title `Device Fleet`, file `grafana/dashboards/device-fleet.json` (the compose home-dashboard env var points at this filename) |
 | Dashboard columns | device_id, hostname, state (ONLINE/OFFLINE, colour coded), last seen, CPU %, memory %, disk %, temperature, uptime |
 | Alert rule | uid `device-offline`, title `DeviceOffline`, folder `Device Fleet`, group `device-health` |
-| Alert behaviour | one alert instance per `device_id`; condition age > 30 s; pending `for: 30s`; evaluated every `10s`; labels `severity=critical`, `device_id`; no-data and error states must not fire spuriously |
+| Alert behaviour | one alert instance per `device_id`; condition age > 30 s; pending `for: 30s`; evaluated every `10s`; labels `severity=critical` (`device_id` comes from the query labels); `noDataState: OK` (a device with no series is not alerting); `execErrState: Error` (if VictoriaMetrics is unreachable Grafana raises a separate DatasourceError alert rather than marking every device DeviceOffline) |
 | Notifications | No contact point is configured. State is visible in Grafana Alerting and through its API. This is a documented limitation. |
 
 Mounts (already in `docker-compose.yml`):

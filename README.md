@@ -58,9 +58,11 @@ Both demo "devices" are the same machine here; what tells them apart is the `--d
 
 Go to <http://localhost:3000> and log in with `admin` / `admin` (Grafana may ask you to change the
 password; you can skip that). The **Device Fleet** dashboard opens as the home page. Within about
-10 seconds you should see one row per device: device ID, hostname, state (ONLINE / OFFLINE), last
-seen, CPU %, memory %, disk %, temperature and uptime. Temperature shows "N/A" on machines without
-`/sys/class/thermal`.
+15 to 20 seconds of starting the agents you should see one row per device: device ID, hostname,
+state (ONLINE / OFFLINE), last seen, CPU %, memory %, disk % and uptime. A **temperature** column
+appears as soon as any device reports one (a Raspberry Pi does, via `/sys/class/thermal`); devices
+without a sensor then show "N/A" in it. If no device has a sensor, as on many VMs, the column is
+simply not shown.
 
 ### 4. Simulate a device going offline
 
@@ -68,9 +70,10 @@ Press **Ctrl+C** in the `demo-pi-2` terminal.
 
 - **Within roughly 30 to 40 seconds** the `demo-pi-2` row switches to **OFFLINE** (a device is
   offline when it has not reported for more than 30 s). `demo-pi-1` stays ONLINE.
-- In Grafana go to **Alerting, then Alert rules**, folder **Device Fleet**, group `device-health`.
-  The **DeviceOffline** rule shows an instance for `demo-pi-2` that is first **Pending** and then
-  **Firing** roughly a minute after you stopped the agent. No instance fires for `demo-pi-1`.
+- In Grafana go to **Alerting, then Alert rules**, expand the folder **Device Fleet** and the group
+  `device-health`, and click **DeviceOffline**. The **Instances** tab (and the Threshold table at the
+  bottom of the page) lists one instance per device. `demo-pi-2` goes **Pending** and then **Firing**
+  about 70 seconds after you stopped the agent; `demo-pi-1` stays **Normal**.
 - Start `demo-pi-2` again: it returns to ONLINE and the alert instance goes back to Normal
   within roughly 20 s (the rule is evaluated every 10 s).
 
