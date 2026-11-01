@@ -142,6 +142,12 @@ python agent/device_agent.py --device-id garage-pi --endpoint 192.168.1.10:4317
 Two devices that use the same `--device-id` overwrite each other's data, so give every device its own.
 Keeping the agent running across reboots (for example as a service) is up to you and is not covered here.
 
+**Give the server a stable address.** Devices find it by the `--endpoint` you give them. If the
+server's IP can change (ordinary DHCP, or a phone hotspot, which picks a new subnet from time to
+time), devices will silently stop reporting. Reserve the server's address in your router, or use a
+hostname you know resolves from your devices. Do not set a fixed IP on a phone-hotspot Wi-Fi profile:
+the subnet changes and the device ends up unreachable.
+
 > **Trusted networks only.** Port 4317 has **no authentication and no TLS**. Anyone who can reach it
 > can write metrics under any device name. Use it on a private LAN or VPN, never on the open internet.
 > The Grafana login is the default `admin` / `admin`.
@@ -194,6 +200,16 @@ Then `docker compose up -d`. Without `-v`, old devices stay on the dashboard for
 The stack provisions a data source with that name. If your Grafana volume already holds one that you
 created by hand, delete that one in Grafana (Connections, Data sources) or do a clean reset as above.
 
+**I forgot the Grafana password** (for example you changed it when Grafana asked on first login).
+Reset it to `admin` without touching your dashboard, alert rule or data:
+
+```bash
+docker compose exec grafana grafana cli admin reset-admin-password admin
+```
+
+If your browser still rejects `admin` / `admin`, it may be auto-filling an old saved password; try a
+private window.
+
 ---
 
 ## How it works
@@ -229,7 +245,7 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 - **Offline detection is not instant.** It needs a push every 5 s and takes about a minute from the device stopping to the alert firing.
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
 - **Single node, demo scale.** One VictoriaMetrics, one Collector, one Grafana, no redundancy or retention tuning.
-- **Verified on x86_64 Linux only** so far; whether the pinned images and the agent behave the same on a Raspberry Pi (aarch64) has not been checked by this repository's validation.
+- **Verified on x86_64 Linux and on one Raspberry Pi 5** (aarch64, Debian 13 "trixie"), where the stack and both demo agents ran on the same Pi and the dashboard was viewed from a laptop. **Not yet verified:** a separate device pushing to the server over the network, 32-bit Raspberry Pi OS, Pi Zero-class hardware, and ESP32-class devices (the agent is Linux-only). See [docs/VALIDATION.md](docs/VALIDATION.md).
 - **Demonstration only.** Not production-ready and not suitable for clinical or medical-device use.
 
 ---

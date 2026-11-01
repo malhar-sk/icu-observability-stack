@@ -1,10 +1,13 @@
 # Validation report
 
-One validation session on a single machine. **No human walked through the quickstart and nothing
-was run on a Raspberry Pi or on arm64**; see the items marked PARTIAL and the "Not validated" list.
-Screenshots referenced below are in [docs/img](img/).
+Three runs. Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+**Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
+commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
+the server over the network**; see the items marked PARTIAL and the "Not validated" list.
+Screenshots in [docs/img](img/) are from runs A and B. Run C's screenshots show the owner's desktop and
+are not committed; its numbers below are read from them and from pasted terminal output.
 
-## Environment
+## Environment (runs A and B, x86_64)
 
 | Item | Value |
 |---|---|
@@ -35,18 +38,48 @@ processes; Ctrl+C was SIGINT.
 | 7 | `./scripts/validate.sh` (from empty volumes) | Exit code 0, 18 of 18 steps passed. |
 | 8 | `docker compose down`, then `docker compose up -d` | Containers removed, volumes kept; `demo-pi-1` and `demo-pi-2` still queryable in VictoriaMetrics afterwards; dashboard still present. |
 
+## Run C: Raspberry Pi 5 (stack and both agents on the same Pi)
+
+| Item | Value |
+|---|---|
+| Date / time | 2026-11-01, about 11:03 to 11:48 UTC (the screenshots show IST, UTC+5:30) |
+| Run by | The Pi's owner, over SSH from a Windows laptop, following commands given by an AI |
+| Commit | `6665851` |
+| Host | Raspberry Pi 5 Model B Rev 1.1, 8 GB RAM, aarch64, booting from SD card, 90 GB free |
+| OS / Docker / Compose / Python | Debian GNU/Linux 13 (trixie) / 29.4.1 / v5.1.3 / 3.13.5 |
+| Network | Phone hotspot (mobile data). Pi and laptop on the same hotspot; dashboard viewed from the laptop at `http://<pi-ip>:3000`. |
+| Clean start | Fresh clone and newly created Docker volumes. Other containers already on the Pi were untouched. |
+
+| Check | Result | Evidence |
+|---|---|---|
+| `git clone -b claude/happy-franklin-k77hxk <url>` | PASS | HEAD `6665851`; no credentials asked (the repo is public). |
+| `docker compose up -d` | PASS | Three images pulled over the hotspot: VictoriaMetrics 25 s, collector 104 s, Grafana 202 s. Containers started in about 13 s. |
+| Images are arm64 | PASS | `docker image inspect` printed `arm64` for all three. |
+| Services healthy | PASS | `docker compose ps` all Up. VictoriaMetrics `OK`; Grafana `"database": "ok"`, 13.3.0. |
+| Agents `demo-pi-1`, `demo-pi-2` | PASS | Both ran from a venv, so `pip install -r agent/requirements.txt` worked on aarch64 with Python 3.13. The install output and the `--dry-run` output were not captured. |
+| Real temperature sensor | PASS | Dashboard showed 48.0 °C, later 46.3 to 46.9 °C, for both devices. At the same time CPU about 1.5%, memory 16.9%, disk 22.9%, uptime 46 min. |
+| Dashboard from another machine | PASS | The laptop's browser showed both devices ONLINE (2 online, 0 offline). |
+| Offline detection | PASS | Ctrl+C on `demo-pi-2`: OFFLINE after **38 s** (owner's stopwatch). Its last seen was 17:14:16; `demo-pi-1` stayed ONLINE. |
+| Alert | PASS | `DeviceOffline` Alerting for `demo-pi-2` since 17:15:30, which is **74 s** after its last sample (Instances tab); `demo-pi-1` Normal. Destination `empty`: no contact point, as documented. |
+| Recovery | PARTIAL | Dashboard back to ONLINE **within at most 17 s** of restarting the agent (the owner came back after 17 s and it was already green; exact time not measured). The alert instance returning to Normal was **not observed** on the Pi. |
+
+Footprint. Server: 587 MB download for the three arm64 images (from registry metadata) and about
+2.6 GB on disk (x86 image sizes). Each device: about 8 MB of aarch64 wheels to download, about 28 MB
+installed, about 43 MB RAM resident (measured on x86, not on a Pi). The 587 MB is paid once, on the
+server, not per device.
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
 |---|---|---|---|
-| 1 | Stack starts with the documented command | PASS | `docker compose ps`: all three services running on the pinned images. VictoriaMetrics `/health` OK, Grafana `/api/health` database ok (both also `PASS` lines in `validate.sh`). |
-| 2 | Agent sends telemetry | PASS | VictoriaMetrics held `device_cpu_/memory_/disk_utilization_percent` and `device_uptime_seconds` for both devices. Agent unit tests: 33 passed. Agent also ran against the declared minimum OTel version (1.25.0). |
-| 3 | Two distinct devices on one dashboard | PASS | Two rows, `demo-pi-1` and `demo-pi-2` ([01](img/01-two-devices-online-fresh-clone.png)). Series have `instance` equal to `device_id` and `job="device-agent"`. |
-| 4 | Health metrics visible | PARTIAL | CPU, memory, disk, uptime visible for each device. Temperature: no sensor exists on this VM. Verified only with the real agent code reading a **fake** sysfs directory: 52.5 °C shown for that device and "N/A" for the sensorless ones ([04](img/04-temperature-mixed-fleet.png)). Not verified on real hardware. |
+| 1 | Stack starts with the documented command | PASS | `docker compose ps`: all three services running on the pinned images. VictoriaMetrics `/health` OK, Grafana `/api/health` database ok (both also `PASS` lines in `validate.sh`). Same on a Raspberry Pi 5 with arm64 images (run C). |
+| 2 | Agent sends telemetry | PASS | VictoriaMetrics held `device_cpu_/memory_/disk_utilization_percent` and `device_uptime_seconds` for both devices. Agent unit tests: 33 passed. Agent also ran against the declared minimum OTel version (1.25.0), and on aarch64 with Python 3.13 (run C). |
+| 3 | Two distinct devices on one dashboard | PASS | Two rows, `demo-pi-1` and `demo-pi-2` ([01](img/01-two-devices-online-fresh-clone.png)). Series have `instance` equal to `device_id` and `job="device-agent"`. Same on the Pi, viewed from a laptop over the network (run C). |
+| 4 | Health metrics visible | PASS | CPU, memory, disk, uptime visible for each device. Temperature: on a **real Pi 5 sensor** it showed 48.0 °C, later 46.3 to 46.9 °C (run C). The x86 VM has no sensor, so there it was checked with the real agent code reading a **fake** sysfs directory: 52.5 °C for that device and "N/A" for the sensorless ones ([04](img/04-temperature-mixed-fleet.png)). The temperature column is absent when no device reports one. |
 | 5 | Last-seen updates | PASS | The same online device showed last seen 06:22:44, then 06:24:49, then 06:26:19 in three screenshots taken minutes apart. |
-| 6 | Offline is distinguishable | PASS | `demo-pi-2` turned red OFFLINE with last seen equal to the stop time while `demo-pi-1` stayed green ([02](img/02-demo-pi-2-offline.png)). Measured 36.2 s (manual) and 36 s (`validate.sh`). |
-| 7 | Alert works | PASS | `DeviceOffline` (Provisioned) Firing for the silent device only; `demo-pi-1` Normal ([03](img/03-alert-firing-for-silent-device.png)). Measured 69 s (manual), 71 s (`validate.sh`); Pending seen on the way. Recovery to Normal 12.1 s after restart. No notification is sent: no contact point is configured. |
-| 8 | Quickstart tested | PARTIAL | The README commands were executed verbatim in a fresh clone and reached the firing alert, but by an agent, not a person who had never seen the project. The clone used `-b claude/happy-franklin-k77hxk` because the branch is not merged to `main`. |
+| 6 | Offline is distinguishable | PASS | `demo-pi-2` turned red OFFLINE with last seen equal to the stop time while `demo-pi-1` stayed green ([02](img/02-demo-pi-2-offline.png)). Measured 36.2 s (manual) and 36 s (`validate.sh`) on x86; 38 s on the Pi 5 (run C). |
+| 7 | Alert works | PASS | `DeviceOffline` (Provisioned) Firing for the silent device only; `demo-pi-1` Normal ([03](img/03-alert-firing-for-silent-device.png)). Measured 69 s (manual), 71 s (`validate.sh`); Pending seen on the way. Recovery to Normal 12.1 s after restart. On the Pi 5 (run C): Alerting 74 s after the device's last sample, dashboard back to ONLINE within 17 s of restarting; the alert returning to Normal was not observed there. No notification is sent: no contact point is configured. |
+| 8 | Quickstart tested | PARTIAL | The README commands were executed verbatim in a fresh clone by an agent (run B), and by a person on a Pi 5 (run C) who reached the firing alert. The person had an AI giving the steps one at a time, so a cold read of the README alone is still untested. The clones used `-b claude/happy-franklin-k77hxk` because the branch is not merged to `main`; **the README's plain `git clone` fetches `main`, which does not contain this work yet**. |
 | 9 | Changes committed | PASS | Committed and pushed to `claude/happy-franklin-k77hxk`; `git status` is clean after the commit that adds this file (`git log` lists it). |
 
 ## Automated check
@@ -66,7 +99,7 @@ rendered dashboard; that was checked separately with screenshots.
 
 | Check | Result | Evidence |
 |---|---|---|
-| Agent on a remote device reached `<server-ip>:4317` | NOT RUN | No second machine was available. |
+| Agent on a remote device reached `<server-ip>:4317` | NOT RUN | No separate device pushed over the network. In run C the agents ran on the same Pi as the server. (A laptop did reach the Pi's Grafana on port 3000; port 4317 from another machine was not tested.) |
 | It appears as a separate row with its own device ID | NOT RUN | As above. |
 
 ## Logs
@@ -77,6 +110,7 @@ rendered dashboard; that was checked separately with screenshots.
 | VictoriaMetrics | No errors. One INFO line that cgroup pressure metrics are unavailable (container quirk). |
 | Grafana | Error-level lines are all its background plugin installer failing to resolve `grafana.com`; this sandbox blocks that host. Harmless for the demo. INFO-level "database is locked, retrying" on first boot. No provisioning errors. |
 | Agents | Clean start and clean shutdown. |
+| Run C (Pi 5) | Container and agent logs were not collected. |
 
 ## Issues found
 
@@ -90,11 +124,16 @@ rendered dashboard; that was checked separately with screenshots.
 | 6 | Graphs show "No data" for the first ~20 to 30 s after a device starts. | Low | Documented. |
 | 7 | README step 4 omitted that the alert group is collapsed and that per-device states are on the rule page. | Low | Fixed. |
 | 8 | Alert instances for test device IDs persist for a day, cluttering the rule page after test runs. | Low | Known; `docker compose down -v` clears it. |
+| 9 | The README's plain `git clone` fetches `main`, which does not contain this work until the branch is merged. | Medium | **Open.** Merging to `main` fixes it; not done because no pull request was requested. |
+| 10 | Grafana asks for a new password on first login; one user changed it and then could not log in. | Low | Fixed in the README (troubleshooting entry with the reset command). The command was tested on Grafana 13.3.0 in a container, and the owner then logged in on the Pi. |
+| 11 | If the server's IP changes (DHCP, or a phone hotspot that picks a new subnet), devices silently stop reporting. | Medium | Documented in the README. No code change; a reservation or hostname is the fix. |
+| 12 | The agents ran in SSH sessions, so closing the session stops them and the alert then fires. No start-at-boot setup is provided. | Low | Documented as out of scope in the README. |
 
 ## Not validated
 
-- A real Raspberry Pi, any arm64 host, or a real temperature sensor.
-- A second physical machine pushing over a network, or any firewall behaviour.
-- A person following the quickstart cold.
+- A separate device pushing to the server over the network (port 4317 from another machine), or any firewall behaviour.
+- 32-bit Raspberry Pi OS, Pi Zero-class hardware, and ESP32-class devices (the agent is Linux-only; an HTTP path to port 4318 worked in a `curl` test only).
+- A person following the README cold, without step-by-step help.
+- The alert returning to Normal on the Pi (seen only on x86).
 - Notification delivery (none is configured).
-- Behaviour with more than a handful of devices, long retention, or restarts of the agent across reboots.
+- Behaviour with more than a handful of devices, long retention, or agents restarting across reboots.
