@@ -1,0 +1,71 @@
+# One Grafana-managed alert rule, one alert instance per device_id.
+# Semantics are fixed by docs/CONTRACT.md: age = time() - tlast_over_time(device_uptime_seconds[1d]),
+# OFFLINE when age > 30 s, 'for: 30s', evaluated every 10 s.
+#
+# Deliberately NOT provisioned: contact point and notification policy (none is configured;
+# alert state is visible in Grafana Alerting and through its API).
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: device-health
+    folder: Device Fleet
+    interval: 10s
+    rules:
+      - uid: device-offline
+        title: DeviceOffline
+        condition: C
+        for: 30s
+        # A device that never reported is invisible (no series), so no data is not an alert.
+        noDataState: OK
+        execErrState: Error
+        isPaused: false
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Device {{ $labels.device_id }} has not reported for {{ printf "%.0f" $values.B.Value }} s (threshold 30 s)'
+        data:
+          # A: seconds since the last device_uptime_seconds sample, one series per device_id
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: victoriametrics
+            model:
+              refId: A
+              datasource:
+                type: prometheus
+                uid: victoriametrics
+              expr: max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          # B: reduce each series to a number
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+              datasource:
+                type: __expr__
+                uid: __expr__
+          # C: threshold, age > 30 s fires
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 30
+              datasource:
+                type: __expr__
+                uid: __expr__
