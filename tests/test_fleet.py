@@ -246,6 +246,11 @@ class AddTests(WithFakeVM):
         self.assertEqual(code, 0)
         self.assertIn("--device-id kitchen-pi --endpoint 10.0.0.5:4317", out)
         self.assertIn("scp", out)
+        # both ways to run it are offered, and the installer is part of what gets copied over
+        self.assertIn("install-service.sh USER@DEVICE", out)
+        self.assertIn("sudo bash install-service.sh --device-id kitchen-pi --endpoint 10.0.0.5:4317", out)
+        self.assertIn("starts at boot", out)
+        self.assertNotIn("not set up to start at boot", out)
         self.assertNotIn("can change", out)  # the hotspot warning only appears for an auto-detected address
 
     def test_known_offline_device_is_allowed_with_a_note(self):
