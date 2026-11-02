@@ -1,6 +1,6 @@
 # Validation report
 
-Five runs. Run D tested the `./fleet` helper and run E its `notify` command (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+Six runs. Run D tested the `./fleet` helper, run E its `notify` command and run F the start-at-boot service installer (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
 **Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
 commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
 the server over the network**; see the items marked PARTIAL and the "Not validated" list.
@@ -118,6 +118,32 @@ Bugs the work found, all fixed: `set` said "Alerts now go to X" before Grafana h
 `./fleet ... | head` printed a `BrokenPipeError` traceback; and a test fixture that made one test wait out
 a 100 s timeout.
 
+## Run F: start at boot, `agent/install-service.sh` (real systemd 252 in a container, x86_64)
+
+Tested under a **real systemd** (Debian 12, systemd 252) running as PID 1 in a privileged container that
+shared the host's network, reporting to the real stack on the host. **This is not a Raspberry Pi and not a
+real power cycle.** A "reboot" here is a container restart: systemd stops and boots again, and the files
+stay.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Install on a device that never had the agent | PASS | 18.6 s including downloading the two Python packages. The service was `active` and `enabled`, running as a throwaway unprivileged user (`device-agent`), not root. The device appeared on the stack. |
+| Crash recovery | PASS | `kill -9` on the agent: the journal showed `status=9/KILL` and "Scheduled restart job"; a new process started **5.3 s** later, `NRestarts` went 0 to 1, and the device was ONLINE again. (My first attempt did not actually kill anything because the container had no `kill` binary, and my script wrongly reported success; it was redone properly.) |
+| Start at boot | PASS | After restarting the container, systemd came up in about 11 s with the service already `enabled` and `active` (new process id), and a **new sample reached the stack 12 s after the restart**, with nobody starting the agent. |
+| The unit is valid | PASS | `systemd-analyze verify`: no problems. |
+| Sandboxing | PASS, tightened | The first sandbox scored **8.1 EXPOSED** in `systemd-analyze security`. I added options that are safe for an agent that only reads `/proc` and `/sys` (no capabilities, read-only kernel settings, no namespaces or realtime, and others). It now scores **3.9 OK**. Syscall filters and memory restrictions were left out on purpose because they can break Python extensions. |
+| The sandbox still allows everything the agent needs | PASS | All five metrics reached the stack from the sandboxed service, including temperature from a fake sensor (51.234 became 51.23). The sensor was a directory bind-mounted over `/sys/class/thermal`, not real sysfs. Crash recovery was re-tested after tightening (pid 290 to 317). |
+| Re-running to change a setting | PASS | `--interval 2`: the agent restarted and the journal showed `interval=2s`. |
+| Re-running from the install folder itself | PASS | Found in self-review: copying a file onto itself would have failed. Fixed; re-running `/opt/device-agent/install-service.sh --interval 3` worked and the agent picked up `PUSH_INTERVAL=3`. |
+| A failing `systemctl enable` is not hidden | PASS | Found in self-review: the error was swallowed, so a device could look installed but not start at boot. With a stand-in `systemctl` whose `enable` fails, the installer now stops with `error: could not enable device-agent to start at boot: <the reason>` and exit 1. A normal install stays quiet. (My first attempt at this test silently tested nothing, because the stand-in was not picked up; it was redone with a proper file.) |
+| Refuses a normal user | PASS | "run with sudo", exit 1, the running service untouched. |
+| Missing agent files | PASS | A clear error naming the folder, exit 1, the running service untouched. |
+| `--uninstall` | PASS | Service stopped and disabled, process gone, `/opt/device-agent`, the env file and the unit removed. A second uninstall was harmless. About 40 s later the stack showed the device OFFLINE. |
+| Input validation | PASS | 16 tests (15 run as root, 1 skipped) feed the script bad IDs, endpoints, intervals and paths, including values that try to inject extra lines into the env file; all are rejected before anything is written. One test checks the script's ID rule against the agent's own. Shellcheck is clean. With the earlier tests, 115 tests run in about 8 s: 114 pass and 1 is skipped when run as root (it needs a normal user, which I ran by hand: it refused with "run with sudo"). |
+
+Noise in the test bed only: the container borrowed the host's Python, which printed a harmless
+`_distutils_hack` warning. A real device would not.
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -129,7 +155,7 @@ a 100 s timeout.
 | 5 | Last-seen updates | PASS | The same online device showed last seen 06:22:44, then 06:24:49, then 06:26:19 in three screenshots taken minutes apart. |
 | 6 | Offline is distinguishable | PASS | `demo-pi-2` turned red OFFLINE with last seen equal to the stop time while `demo-pi-1` stayed green ([02](img/02-demo-pi-2-offline.png)). Measured 36.2 s (manual) and 36 s (`validate.sh`) on x86; 38 s on the Pi 5 (run C). |
 | 7 | Alert works | PASS | `DeviceOffline` (Provisioned) Firing for the silent device only; `demo-pi-1` Normal ([03](img/03-alert-firing-for-silent-device.png)). Measured 69 s (manual), 71 s (`validate.sh`); Pending seen on the way. Recovery to Normal 12.1 s after restart. On the Pi 5 (run C): Alerting 74 s after the device's last sample, dashboard back to ONLINE within 17 s of restarting; the alert returning to Normal was not observed there. By default no notification is sent; `./fleet notify` adds one (run E). |
-| 8 | Quickstart tested | PARTIAL | The README commands were executed verbatim in a fresh clone by an agent (run B), and by a person on a Pi 5 (run C) who reached the firing alert. The person had an AI giving the steps one at a time, so a cold read of the README alone is still untested. The clones used `-b claude/happy-franklin-k77hxk` because the branch is not merged to `main`; **the README's plain `git clone` fetches `main`, which does not contain this work yet**. |
+| 8 | Quickstart tested | PARTIAL | The README commands were executed verbatim in a fresh clone by an agent (run B), and by a person on a Pi 5 (run C) who reached the firing alert. The person had an AI giving the steps one at a time, so a cold read of the README alone is still untested. The clones used `-b claude/happy-franklin-k77hxk` because the work was not yet in `main`. **That is no longer needed: since PR #1 was merged, a plain `git clone` of `main` (the README's first command) has everything, and its 99 tests pass (checked).** |
 | 9 | Changes committed | PASS | Committed and pushed to `claude/happy-franklin-k77hxk`; `git status` is clean after the commit that adds this file (`git log` lists it). |
 
 ## Automated check
@@ -174,10 +200,10 @@ rendered dashboard; that was checked separately with screenshots.
 | 6 | Graphs show "No data" for the first ~20 to 30 s after a device starts. | Low | Documented. |
 | 7 | README step 4 omitted that the alert group is collapsed and that per-device states are on the rule page. | Low | Fixed. |
 | 8 | Alert instances for test device IDs persist for a day, cluttering the rule page after test runs. | Low | Known; `docker compose down -v` clears it. |
-| 9 | The README's plain `git clone` fetches `main`, which does not contain this work until the branch is merged. | Medium | **Open.** Merging to `main` fixes it; not done because no pull request was requested. |
+| 9 | The README's plain `git clone` fetched `main`, which did not contain this work until the branch was merged. | Medium | **Fixed** by merging PR #1 (squash commit `3b509f7`). Checked afterwards: a plain clone of `main` has `fleet`, the agent, the dashboard and the pinned images, and all 99 tests pass from it. |
 | 10 | Grafana asks for a new password on first login; one user changed it and then could not log in. | Low | Fixed in the README (troubleshooting entry with the reset command). The command was tested on Grafana 13.3.0 in a container, and the owner then logged in on the Pi. |
 | 11 | If the server's IP changes (DHCP, or a phone hotspot that picks a new subnet), devices silently stop reporting. | Medium | Documented in the README. No code change; a reservation or hostname is the fix. |
-| 12 | The agents ran in SSH sessions, so closing the session stops them and the alert then fires. No start-at-boot setup is provided. | Low | Documented as out of scope in the README. |
+| 12 | The agents ran in SSH sessions, so closing the session stops them and the alert then fires. No start-at-boot setup was provided. | Low | Fixed by `agent/install-service.sh` (run F). Tested under systemd in a container on x86, not yet on a Pi. |
 | 13 | Grafana applies a changed notification setting only on a one-minute cycle, so right after a change alerts still use the old one. | Medium | Measured (about 58 to 60 s). `fleet notify set` waits for the switch-over, `--no-wait` and `status` say so, and the README explains it. |
 
 ## Not validated
@@ -189,4 +215,5 @@ rendered dashboard; that was checked separately with screenshots.
 - A person following the README cold, without step-by-step help.
 - The alert returning to Normal on the Pi (seen only on x86).
 - Notifications reaching the real Discord, Slack or Telegram services, email, repeat messages after the 4-hour repeat interval, flapping devices, and `notify` on the Raspberry Pi.
-- Behaviour with more than a handful of devices, long retention, or agents restarting across reboots.
+- Behaviour with more than a handful of devices, or long retention.
+- `install-service.sh` on a Raspberry Pi or any real device, a real power cycle, systemd older than 247 (the `ProtectProc` option would be ignored with a warning; not tried), other distributions, and a device with no internet (the installer needs it once).

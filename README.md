@@ -239,7 +239,22 @@ python agent/device_agent.py --device-id garage-pi --endpoint 192.168.1.10:4317
 ```
 
 Two devices that use the same `--device-id` overwrite each other's data, so give every device its own.
-Keeping the agent running across reboots (for example as a service) is up to you and is not covered here.
+**Keep it running across reboots.** Running the agent by hand stops when you close the terminal or the
+device restarts. To make it a service that starts at boot and restarts itself if it crashes, copy
+`agent/install-service.sh` over together with the agent (`./fleet add` shows the `scp` line) and, on the
+device:
+
+```bash
+sudo bash install-service.sh --device-id garage-pi --endpoint 192.168.1.10:4317
+```
+
+It needs systemd and internet access once (to install the agent's two Python packages), puts everything
+under `/opt/device-agent` with its own Python environment, and runs the agent as a throwaway
+unprivileged user with a restricted sandbox. Re-run it to change a setting; undo it with
+`sudo bash install-service.sh --uninstall`. Add `--print` to see exactly what it would write without
+changing anything. Check on it with `systemctl status device-agent` and `journalctl -u device-agent -f`.
+Tested under a real systemd in a container (start, crash recovery, reboot, uninstall); **not yet on a
+Raspberry Pi**.
 
 **Give the server a stable address.** Devices find it by the `--endpoint` you give them. If the
 server's IP can change (ordinary DHCP, or a phone hotspot, which picks a new subnet from time to
@@ -341,7 +356,7 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 
 - **No authentication or TLS** anywhere: agents send plaintext gRPC and anyone who can reach port 4317 can inject data. Grafana uses `admin` / `admin`.
 - **No device registry.** A device that has never reported is invisible, and a device silent for more than a day drops off the dashboard. That is why `./fleet add` cannot "create" a device on the server: a device exists once it reports.
-- **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there, and agents do not start at boot. `./fleet` was tested on x86_64 Linux; it has not been run on the Raspberry Pi.
+- **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there; on a device, `agent/install-service.sh` makes the agent start at boot (systemd only). Both `./fleet` and the installer were tested on x86_64 Linux; neither has been run on the Raspberry Pi.
 - **Notifications are opt-in.** Until you run `./fleet notify set ...`, an alert is visible only inside Grafana (and its API). `fleet notify` covers Discord, Slack, Telegram and webhooks, not email, and only the webhook path was tested end to end.
 - **Offline detection is not instant.** It needs a push every 5 s and takes about a minute from the device stopping to the alert firing.
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
