@@ -115,7 +115,9 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   || die "device_agent.py and requirements.txt must be in the same folder as this script ($SRC)"
 
 mkdir -p "$DIR"
-install -m 0644 "$SRC/device_agent.py" "$SRC/requirements.txt" "$DIR/"
+if [ "$SRC" != "$DIR" ]; then  # re-running from the install folder itself must not try to copy a file onto itself
+  install -m 0644 "$SRC/device_agent.py" "$SRC/requirements.txt" "$DIR/"
+fi
 [ -x "$DIR/venv/bin/python" ] || python3 -m venv "$DIR/venv"
 "$DIR/venv/bin/python" -m pip install -q -r "$DIR/requirements.txt" \
   || die "could not install the agent's Python packages (is this device online?)"
@@ -124,7 +126,9 @@ render_env > "$ENV_FILE"; chmod 0644 "$ENV_FILE"
 render_unit > "$UNIT"; chmod 0644 "$UNIT"
 
 systemctl daemon-reload
-systemctl enable "$NAME" >/dev/null 2>&1
+if ! enable_out=$(systemctl enable "$NAME" 2>&1); then  # quiet when it works, detailed when it does not
+  die "could not enable $NAME to start at boot: $enable_out"
+fi
 systemctl restart "$NAME"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ "$(systemctl is-active "$NAME")" = active ] && break
