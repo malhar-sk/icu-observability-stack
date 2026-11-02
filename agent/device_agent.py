@@ -24,6 +24,9 @@ THERMAL_GLOB = "/sys/class/thermal/thermal_zone*/temp"
 TEMP_MIN_C, TEMP_MAX_C = -40.0, 150.0
 METRICS = ("device_cpu_utilization_percent", "device_memory_utilization_percent",
            "device_disk_utilization_percent", "device_uptime_seconds", "device_temperature_celsius")
+# How often this device promises to report. The dashboard and the alert use it to decide when "quiet" means
+# OFFLINE (3 x this, never less than 30 s), so a device that reports slowly on purpose is not flagged.
+INTERVAL_METRIC = "device_report_interval_seconds"
 
 
 # Pure parsers: take file contents or stat results, so they are easy to unit test.
@@ -211,6 +214,7 @@ def run(cfg, sampler, attrs):
 
     for name in METRICS:  # no unit on purpose: the Collector would append a name suffix
         meter.create_observable_gauge(name, callbacks=[make_callback(name)])
+    meter.create_observable_gauge(INTERVAL_METRIC, callbacks=[lambda options: [Observation(cfg.interval, attrs)]])
 
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -230,7 +234,8 @@ def main(argv=None):
     if cfg.dry_run:
         time.sleep(0.5)  # give the CPU delta a window to measure
         resource = {"service.name": "device-agent", "service.instance.id": cfg.device_id}
-        print(json.dumps({"resource": resource, "labels": attrs, "metrics": sampler.snapshot()}, indent=2))
+        metrics = {**sampler.snapshot(), INTERVAL_METRIC: cfg.interval}
+        print(json.dumps({"resource": resource, "labels": attrs, "metrics": metrics}, indent=2))
     else:
         run(cfg, sampler, attrs)
     return 0

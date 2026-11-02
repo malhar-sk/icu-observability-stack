@@ -13,7 +13,9 @@ a handful of Raspberry Pi or Linux devices. Each device runs a tiny Python agent
 health (CPU, memory, disk, uptime and, where available, temperature) to a central server. You
 watch **every device's health and connectivity on one Grafana dashboard** and get an alert when a
 device stops reporting. The server side is plain Docker Compose: OpenTelemetry Collector,
-VictoriaMetrics and Grafana.
+VictoriaMetrics and Grafana. Boards that cannot run the agent (ESP32, Pico W and other
+microcontrollers, custom hardware) can report over **MQTT** instead; see
+[Boards that speak MQTT](#boards-that-speak-mqtt-optional).
 
 ### Prerequisites
 
@@ -27,6 +29,7 @@ VictoriaMetrics and Grafana.
 | 4317 | OpenTelemetry Collector, OTLP gRPC (what the agents send to) |
 | 4318 | OpenTelemetry Collector, OTLP HTTP (published, not used by the agent) |
 | 8428 | VictoriaMetrics (storage and query API) |
+| 1883 | Only with `./fleet up --mqtt`: the MQTT broker for boards that speak MQTT |
 
 ### Commands at a glance
 
@@ -34,12 +37,12 @@ One helper, `./fleet`, runs everything below. Use it on the machine that hosts t
 
 | Command | What it does |
 |---|---|
-| `./fleet up` | Start everything, wait until it is ready, print the dashboard address |
+| `./fleet up` | Start everything, wait until it is ready, print the dashboard address. `--mqtt` also starts the [MQTT input](#boards-that-speak-mqtt-optional) |
 | `./fleet down` | Stop everything. **Asks first** and confirms afterwards. `--wipe` also deletes stored data |
 | `./fleet status` | Is the stack healthy, and how many devices are online |
 | `./fleet list` | Every device: state, last seen, CPU, memory, disk, temperature, uptime (`--json` for scripts) |
 | `./fleet check <id>` | One device in detail |
-| `./fleet add <id>` | Onboard a device: prints what to run on it and waits until it appears |
+| `./fleet add <id>` | Onboard a device: prints what to run on it and waits until it appears (`--mqtt` for a board that speaks MQTT) |
 | `./fleet remove <id>` | Forget a retired device (deletes its stored data, asks first) |
 | `./fleet notify set\|test\|status\|off` | Send alerts to Discord, Slack, Telegram or a webhook |
 
@@ -196,6 +199,11 @@ scripts/validate.sh --help   # environment overrides (VM_URL, GRAFANA_URL, GRAFA
 It uses the device IDs `demo-pi-1` and `demo-pi-2`, so stop your own agents with those IDs first.
 Record results in [docs/VALIDATION.md](docs/VALIDATION.md).
 
+`scripts/validate_mqtt.sh` does the same for the [MQTT input](#boards-that-speak-mqtt-optional): it runs
+`./fleet up --mqtt`, simulates three boards (one declaring a 60 s interval, one that stops), and checks
+access control, labels, offline detection, the alert and that a bridge restart does not revive a dead board
+(about four minutes). It uses the IDs `test-m-a`, `test-m-b` and `test-m-slow` and removes them afterwards.
+
 ---
 
 ## Configuration
@@ -261,6 +269,23 @@ server's IP can change (ordinary DHCP, or a phone hotspot, which picks a new sub
 time), devices will silently stop reporting. Reserve the server's address in your router, or use a
 hostname you know resolves from your devices. Do not set a fixed IP on a phone-hotspot Wi-Fi profile:
 the subnet changes and the device ends up unreachable.
+
+### Boards that speak MQTT (optional)
+
+For things that cannot run the Linux agent but can publish MQTT: ESP32, Pico W, Arduino with Wi-Fi or
+Ethernet, custom boards. They appear in the same dashboard with the same ONLINE/OFFLINE state and alert.
+
+```bash
+./fleet up --mqtt                  # starts a broker (Mosquitto) and the bridge too; remembered next time
+./fleet add garage-esp32 --mqtt    # prints the broker address, login and topics the board needs, then waits
+```
+
+A board publishes plain numbers on `fleet/<device_id>/<metric>`, for example `fleet/garage-esp32/uptime_seconds`
+(required, it is the "alive" signal) and `fleet/garage-esp32/temperature_celsius`. It can also say how often it
+reports (`report_interval_seconds`), so a board that wakes once a minute is not flagged after 30 s. Already run a
+broker? `./fleet up --mqtt-broker 192.168.1.20 --mqtt-user ha`. Turn it off with `./fleet up --no-mqtt`.
+Costs about 126 MB of disk and 18 MiB of RAM. Everything about it, with shell, Python, MicroPython and Arduino
+examples, is in [docs/MQTT.md](docs/MQTT.md).
 
 > **Trusted networks only.** Port 4317 has **no authentication and no TLS**. Anyone who can reach it
 > can write metrics under any device name. Use it on a private LAN or VPN, never on the open internet.
@@ -345,9 +370,12 @@ Each agent samples `/proc` and `/sys` and pushes five gauges, tagged with its `d
 Collector (`otel-collector.yaml`) forwards them unchanged to VictoriaMetrics. Grafana is provisioned
 from files in `grafana/` (data source, dashboard and alert rule), so nothing is set up by hand.
 A device's **last seen** time is the newest `device_uptime_seconds` sample, its **age** is
-`time() - tlast_over_time(device_uptime_seconds[1d])`, and it is **OFFLINE** when the age is above
-30 s (six missed pushes). The `DeviceOffline` rule uses the same query, evaluated every 10 s, with
-a 30 s pending period, and produces one alert instance per device.
+`time() - tlast_over_time(device_uptime_seconds[1d])`, and it is **OFFLINE** when the age is above its
+limit: 30 s (six missed pushes) for the default agent, or 3 times the interval the device declares in
+`device_report_interval_seconds` when that is longer, so a device that reports slowly on purpose is not
+flagged. The `DeviceOffline` rule uses the same query, evaluated every 10 s, with a 30 s pending
+period, and produces one alert instance per device. Boards that speak MQTT join the same pipeline
+through a small bridge (`bridge/mqtt_bridge.py`) that writes their readings to VictoriaMetrics.
 
 Vector (`vector.toml`) is not part of the default stack. It is parked behind the compose profile
 `legacy-vector` because its demo configuration is broken; do not start it expecting it to work.
@@ -358,10 +386,11 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 - **No device registry.** A device that has never reported is invisible, and a device silent for more than a day drops off the dashboard. That is why `./fleet add` cannot "create" a device on the server: a device exists once it reports.
 - **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there; on a device, `agent/install-service.sh` makes the agent start at boot (systemd only). Both `./fleet` and the installer were tested on x86_64 Linux; neither has been run on the Raspberry Pi.
 - **Notifications are opt-in.** Until you run `./fleet notify set ...`, an alert is visible only inside Grafana (and its API). `fleet notify` covers Discord, Slack, Telegram and webhooks, not email, and only the webhook path was tested end to end.
-- **Offline detection is not instant.** It needs a push every 5 s and takes about a minute from the device stopping to the alert firing.
+- **Offline detection is not instant.** With the default agent it takes about a minute from the device stopping to the alert firing; a device that reports every N seconds is OFFLINE after 3N (at least 30 s), and the alert follows 30 s later.
+- **MQTT is plain and shared.** No TLS, one shared password for all boards, our `fleet/<device_id>/<metric>` topic scheme only (Tasmota, ESPHome, Zigbee2MQTT and Home Assistant topics are not mapped), and no Last Will handling: a board is OFFLINE by silence. Tested with simulated devices and a real broker; **no real ESP32, Pico or Arduino was available**. See [docs/MQTT.md](docs/MQTT.md).
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
 - **Single node, demo scale.** One VictoriaMetrics, one Collector, one Grafana, no redundancy or retention tuning.
-- **Verified on x86_64 Linux and on one Raspberry Pi 5** (aarch64, Debian 13 "trixie"), where the stack and both demo agents ran on the same Pi and the dashboard was viewed from a laptop. **Not yet verified:** a separate device pushing to the server over the network, 32-bit Raspberry Pi OS, Pi Zero-class hardware, and ESP32-class devices (the agent is Linux-only). See [docs/VALIDATION.md](docs/VALIDATION.md).
+- **Verified on x86_64 Linux and on one Raspberry Pi 5** (aarch64, Debian 13 "trixie"), where the stack and both demo agents ran on the same Pi and the dashboard was viewed from a laptop. **Not yet verified:** a separate device pushing to the server over the network, 32-bit Raspberry Pi OS, Pi Zero-class hardware, and real ESP32-class boards (the agent is Linux-only; they use the MQTT input, tested only with simulated devices). See [docs/VALIDATION.md](docs/VALIDATION.md).
 - **Demonstration only.** Not production-ready and not suitable for clinical or medical-device use.
 
 ---

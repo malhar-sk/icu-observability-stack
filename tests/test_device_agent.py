@@ -227,6 +227,13 @@ class CliTests(unittest.TestCase):
                                             "service.instance.id": "test-unit-1"})
         self.assertIn("device_uptime_seconds", data["metrics"])
 
+    def test_the_agent_declares_its_own_report_interval(self):
+        # The offline rule is 3 x this (min 30 s); without it, `--interval 60` would show a healthy agent as OFFLINE.
+        r = self.run_agent("--dry-run", "--device-id", "test-unit-1", "--interval", "60")
+        self.assertEqual(json.loads(r.stdout)["metrics"][da.INTERVAL_METRIC], 60)
+        r = self.run_agent("--dry-run", "--device-id", "test-unit-1")
+        self.assertEqual(json.loads(r.stdout)["metrics"][da.INTERVAL_METRIC], 5)
+
     def test_invalid_device_id_exits_nonzero_with_message(self):
         r = self.run_agent("--dry-run", "--device-id", "Not Valid")
         self.assertNotEqual(r.returncode, 0)

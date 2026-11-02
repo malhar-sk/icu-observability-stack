@@ -52,7 +52,7 @@
             "type": "prometheus",
             "uid": "victoriametrics"
           },
-          "expr": "count(max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) <= 30) or vector(0)",
+          "expr": "count(max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) <= (clamp_min(3 * max by (device_id) (last_over_time(device_report_interval_seconds[1d])), 30) or (0 * max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) + 30))) or vector(0)",
           "instant": true,
           "range": false,
           "legendFormat": "__auto",
@@ -114,7 +114,7 @@
             "type": "prometheus",
             "uid": "victoriametrics"
           },
-          "expr": "count(max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) > 30) or vector(0)",
+          "expr": "count(max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) > (clamp_min(3 * max by (device_id) (last_over_time(device_report_interval_seconds[1d])), 30) or (0 * max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) + 30))) or vector(0)",
           "instant": true,
           "range": false,
           "legendFormat": "__auto",
@@ -163,7 +163,7 @@
       "id": 3,
       "type": "table",
       "title": "Fleet (one row per device_id)",
-      "description": "ONLINE/OFFLINE: age = time() - tlast_over_time(device_uptime_seconds[1d]); OFFLINE when age > 30 s. Last seen is the timestamp of the newest device_uptime_seconds sample. Readings are the last sample from the past minute; N/A means no current sample (sensor not present, or device offline).",
+      "description": "ONLINE/OFFLINE: age = time() - tlast_over_time(device_uptime_seconds[1d]); OFFLINE when age > max(30 s, 3 x the interval the device declares in device_report_interval_seconds). Last seen is the timestamp of the newest device_uptime_seconds sample. Readings are the last sample from the past minute; N/A means no current sample (sensor not present, or device offline).",
       "datasource": {
         "type": "prometheus",
         "uid": "victoriametrics"
@@ -194,7 +194,7 @@
             "type": "prometheus",
             "uid": "victoriametrics"
           },
-          "expr": "max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) > bool 30",
+          "expr": "max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) > bool (clamp_min(3 * max by (device_id) (last_over_time(device_report_interval_seconds[1d])), 30) or (0 * max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) + 30))",
           "instant": true,
           "range": false,
           "legendFormat": "__auto",
@@ -361,6 +361,38 @@
           {
             "matcher": {
               "id": "byName",
+              "options": "device_id"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "hostname"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "-"
+              },
+              {
+                "id": "custom.minWidth",
+                "value": 110
+              },
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
               "options": "state"
             },
             "properties": [
@@ -412,6 +444,10 @@
                   "mode": "fixed",
                   "fixedColor": "text"
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 100
               }
             ]
           },
@@ -440,6 +476,10 @@
                     }
                   }
                 ]
+              },
+              {
+                "id": "custom.width",
+                "value": 110
               }
             ]
           },
@@ -506,6 +546,10 @@
                 "value": {
                   "type": "color-text"
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 90
               }
             ]
           },
@@ -572,6 +616,10 @@
                 "value": {
                   "type": "color-text"
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 100
               }
             ]
           },
@@ -638,6 +686,10 @@
                 "value": {
                   "type": "color-text"
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 90
               }
             ]
           },
@@ -670,6 +722,10 @@
                     }
                   }
                 ]
+              },
+              {
+                "id": "custom.width",
+                "value": 110
               }
             ]
           },
@@ -698,6 +754,10 @@
                     }
                   }
                 ]
+              },
+              {
+                "id": "custom.width",
+                "value": 110
               }
             ]
           }

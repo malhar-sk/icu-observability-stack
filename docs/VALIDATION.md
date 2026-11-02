@@ -1,6 +1,6 @@
 # Validation report
 
-Six runs. Run D tested the `./fleet` helper, run E its `notify` command and run F the start-at-boot service installer (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+Seven runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer and run G the MQTT input with the per-device offline limit (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
 **Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
 commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
 the server over the network**; see the items marked PARTIAL and the "Not validated" list.
@@ -144,6 +144,57 @@ stay.
 Noise in the test bed only: the container borrowed the host's Python, which printed a harmless
 `_distutils_hack` warning. A real device would not.
 
+## Run G: the MQTT input and the per-device offline limit (x86_64, real stack, simulated boards)
+
+Run by an AI agent on the same x86_64 VM as runs A and B (Docker 29.9.2, Compose v5.6.1, Grafana 13.3.0,
+VictoriaMetrics v1.155.0, Mosquitto 2.1.2, paho-mqtt 2.1.0). **Every board was simulated** (shell loops around
+`mosquitto_pub` and `examples/mqtt_device.py`). No ESP32, Pico, Arduino or Raspberry Pi took part.
+
+**Why the offline rule changed.** The old rule was a flat 30 s for every device. That is right for a 5 s agent but wrong for
+anything that reports less often (an MQTT board that wakes once a minute, or the agent with `--interval 60`): it would
+sit at OFFLINE between reports. A device may now declare `device_report_interval_seconds`; the limit is
+`max(30 s, 3 x that)`. Nothing declared means 30 s, exactly as before.
+
+| Check | Result | Evidence |
+|---|---|---|
+| The limit, live against real VictoriaMetrics and Grafana (330 s run, one device per behaviour) | PASS | `test-fast` (declares 5 s, reports every 5 s) and `test-slow` (declares 60 s, reports every 60 s): ONLINE throughout, never an alert. `test-legacy` (declares nothing, one report): OFFLINE at 36 s, Pending 44 s, **Alerting 74.6 s**, the same as before the change. `test-quiet` (declares 60 s, one report): still ONLINE at the old 30 s mark, **OFFLINE at 185 s** (limit 180 s), Pending 193.5 s, **Alerting 223.7 s**. |
+| The alert text uses the right limit | PASS | "Device workshop-esp8266 has not reported for 73 s (it is offline after 30 s of silence)". |
+| Dashboard, alert and CLI agree | PASS | One expression in `docs/CONTRACT.md`; `tests/test_provisioning.py` fails if the dashboard, the alert rule or the CLI's constants drift from it. |
+| The original `scripts/validate.sh`, after the change (real agents) | PASS | 18 of 18. OFFLINE detected 36 s after stopping an agent, alert firing 67 s. It now also checks that `device_report_interval_seconds` arrives fresh from both agents under that exact name. |
+| `./fleet up --mqtt` from empty volumes | PASS | 27 s with the images already downloaded. Five checks: VictoriaMetrics, collector, broker port open, **bridge connected to the broker**, Grafana. The bridge was built from the repo's unchanged Dockerfile (see the environment note below). `.env` created with mode 600. |
+| `scripts/validate_mqtt.sh` | PASS | **23 of 23** steps on the second run (about 4 minutes). See the list below. The first run was 21 of 23; both failures were a bug in the script itself (it could not run a negated check), not in the system. Fixed, and the whole script re-run. |
+| Footprint of the MQTT input | MEASURED | About **126 MB of disk** (Mosquitto image 42 MB, bridge image 85 MB including a small Python) and about **18 MiB of RAM** (broker 3.1 MiB, bridge 14.5 MiB). For comparison, Grafana used 258 MiB, VictoriaMetrics 41 MiB and the collector 35 MiB. |
+| The dashboard with MQTT boards | PASS | [05](img/05-mqtt-boards-in-fleet.png): a Linux agent and three MQTT boards in one table, an empty hostname shown as `-`, readings the board does not send shown as N/A, and `garage-esp32` (reports once a minute) ONLINE at "40s ago". |
+
+`scripts/validate_mqtt.sh` proves, in order: the stack and MQTT start; a wrong password and an anonymous client are
+refused; three boards appear ONLINE (9 to 11 s after their first message) and are reported "via MQTT"; the stored labels are
+exactly `device_id` and `job="mqtt-bridge"`; a reading with a made-up name (`humidity_percent`) is stored while bad
+names and bad payloads (`hot`, `Bad_Name`, `with-dash`, `nan`) create nothing; the declared intervals are stored; a board that
+declared 60 s is **still ONLINE after 45 s of silence**; a board that stops goes **OFFLINE after 33 s** (34 s in the first run); `DeviceOffline` fires for it **66 s** after its last
+report (70 s in the first run) and not for the other two; restarting the bridge does not bring the dead board back; the live board is still ONLINE.
+
+Checked by hand, not part of the script:
+
+| Check | Result | Evidence |
+|---|---|---|
+| Topic access list | PASS (as far as it can be shown) | A message published to `home/x` with the fleet credential never reached a subscriber on `#`, while `fleet/...` traffic did. Mosquitto still answers "granted" to such a subscription for MQTT 3.1.1 clients, so delivery is the evidence. With one credential acting as both publisher and reader, this shows that traffic outside `fleet/` is dropped, not which side drops it. |
+| Retained settings survive a broker restart | PASS | The retained `report_interval_seconds` was still there after `restart mosquitto`, and the bridge reconnected by itself (its log shows the loss and the reconnect about 1 s apart). |
+| A bridge restart does not refresh a quiet device | PASS | Newest sample 1793632810.534 before and after. Retained messages are never treated as readings. |
+| VictoriaMetrics down for about 8 s | PASS | Three readings published 0, 3 and 6 s apart during the outage all arrived afterwards, stamped 0, 3 and 6 s apart (their arrival times, not the delivery time). The bridge logged the outage once and the recovery once. |
+| A broker you already run | PASS | A separate Mosquitto on port 1884 with its own user. `./fleet up --mqtt-broker 192.0.2.2:1884 --mqtt-user extuser`: the bridge connected, our own broker was stopped, `.env` switched to `mqtt-bridge`, and a board publishing to the other broker appeared "via MQTT". The password came from `FLEET_MQTT_PASSWORD`; there is no password flag. |
+| A wrong password for that broker | PASS | `./fleet up` stops after its timeout with "mqtt-bridge (the broker at ... refused the connection: Not authorized (check MQTT_USERNAME and MQTT_PASSWORD))". |
+| Port 1883 already in use | PASS | A real listener on 1883: `./fleet up --mqtt` stops before changing anything, names the problem and the way out (`--mqtt-broker`), and `.env` is byte-for-byte unchanged. |
+| Password rotation | PASS | Delete the `MQTT_PASSWORD=` line, run `./fleet up --mqtt`: a new password, the old one refused, the new one accepted, the bridge reconnected. |
+| Switching back to our own broker | PASS | `./fleet up --mqtt` after the external one: new password, no leftover `MQTT_HOST`, bridge connected to `mosquitto:1883`. |
+| `./fleet down --wipe` | PASS | Removed all five containers, including the two MQTT ones (it uses every compose profile), and the volumes. |
+| Unit tests | PASS | **196 run, 195 pass, 1 skipped** (as root) in about 12 s: agent 34, fleet 35, notify 34, MQTT CLI 46, installer 16, bridge 26, provisioning 5. Shellcheck is clean on `validate.sh`, `validate_mqtt.sh` and `install-service.sh`. |
+
+**Environment note (not a defect of the repo).** This sandbox sits behind a TLS-intercepting proxy, so `pip` inside a
+Docker build failed with "self-signed certificate in certificate chain". I did not weaken TLS. For the test I tagged a
+local copy of `python:3.13-alpine` whose pip config trusts the sandbox proxy's CA, so the repo's **unchanged**
+Dockerfile built through `./fleet up --mqtt`. (My first manual build used a scratchpad copy of the Dockerfile with the same
+fix.) A normal machine with ordinary internet access does not have this problem.
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -167,6 +218,9 @@ Noise in the test bed only: the container borrowed the host's Python, which prin
 | Steps passed | 18 of 18 |
 | Seconds from stopping the agent to OFFLINE | 36 |
 | Seconds from stopping the agent to alert Firing | 71 |
+
+Re-run after the per-device offline limit was added (run G): still 18 of 18, OFFLINE at 36 s, alert at 67 s.
+`./scripts/validate_mqtt.sh` is the equivalent for the MQTT input: 23 of 23 (run G).
 
 It checks the data path, offline detection and the alert through the APIs. It does not look at the
 rendered dashboard; that was checked separately with screenshots.
@@ -205,6 +259,14 @@ rendered dashboard; that was checked separately with screenshots.
 | 11 | If the server's IP changes (DHCP, or a phone hotspot that picks a new subnet), devices silently stop reporting. | Medium | Documented in the README. No code change; a reservation or hostname is the fix. |
 | 12 | The agents ran in SSH sessions, so closing the session stops them and the alert then fires. No start-at-boot setup was provided. | Low | Fixed by `agent/install-service.sh` (run F). Tested under systemd in a container on x86, not yet on a Pi. |
 | 13 | Grafana applies a changed notification setting only on a one-minute cycle, so right after a change alerts still use the old one. | Medium | Measured (about 58 to 60 s). `fleet notify set` waits for the switch-over, `--no-wait` and `status` say so, and the README explains it. |
+| 14 | A flat 30 s offline rule shows any device that reports less often than every few seconds (MQTT boards at 60 s or more, an agent run with `--interval 60`) as permanently OFFLINE. | High | Fixed: devices declare `device_report_interval_seconds`, the limit is `max(30 s, 3 x that)`, and the agent declares its own. Verified live (run G). |
+| 15 | The Mosquitto container could not read the password file it creates at start (root-owned, mode 600, and the broker drops privileges), and restarted in a loop. | High | Fixed (`chown` to the broker's user). Found on the first start. |
+| 16 | A retained `report_interval_seconds` message from a long-gone device would have registered it as "seen", so the bridge would have wrongly warned that it never publishes uptime; retained settings also had no cap. | Low | Found while re-reading my own code, before the first test. Fixed, with tests. |
+| 17 | The pretend-device script printed "report 1" after a wrong password: the broker's refusal arrives after the TCP connection is already open. | Medium | Fixed: it stops with "the broker refused the login" and exit code 1. This is the mistake a hobbyist is most likely to make. |
+| 18 | `host:` with an empty port was accepted as the default port. | Low | Fixed (a unit test caught it). |
+| 19 | A wider `device_id` column pushed the table past the panel and clipped the uptime column. | Low | Found in a screenshot of my own change. Fixed with fixed column widths; checked again ([05](img/05-mqtt-boards-in-fleet.png)). |
+| 20 | My first draft of `scripts/validate_mqtt.sh` polled a condition it had already evaluated once, and could not run a negated check. | Low | Found in review and by the first run (21 of 23). Fixed; the whole script re-run: 23 of 23. |
+| 21 | The Docker image tag `eclipse-mosquitto:2.1.2` does not exist on Docker Hub (the broker reports 2.1.2 under `:2`). | Low | Pinned to the real tag, `2.1.2-alpine`, which also has arm64 and 32-bit arm builds. |
 
 ## Not validated
 
@@ -216,4 +278,8 @@ rendered dashboard; that was checked separately with screenshots.
 - The alert returning to Normal on the Pi (seen only on x86).
 - Notifications reaching the real Discord, Slack or Telegram services, email, repeat messages after the 4-hour repeat interval, flapping devices, and `notify` on the Raspberry Pi.
 - Behaviour with more than a handful of devices, or long retention.
+- **Any real MQTT board.** ESP32, Pico W, Arduino and other hardware never touched this. The MicroPython and Arduino examples in `docs/MQTT.md` were not run or compiled; only the shell and Python examples were run.
+- The MQTT input on a Raspberry Pi (both images are published for arm64, but nothing was started there), building the bridge image on a Pi, and a broker that requires TLS or speaks only MQTT 5 (not supported).
+- The MQTT input under load: the 500-device and 64-metric limits and the 20,000-reading buffer are unit-tested, not stress-tested.
+- Last Will handling (not implemented: a board is OFFLINE by silence) and topics from Tasmota, ESPHome, Zigbee2MQTT or Home Assistant (not mapped).
 - `install-service.sh` on a Raspberry Pi or any real device, a real power cycle, systemd older than 247 (the `ProtectProc` option would be ignored with a warning; not tried), other distributions, and a device with no internet (the installer needs it once).

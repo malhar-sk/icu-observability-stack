@@ -47,6 +47,7 @@ ALWAYS_PRESENT_METRICS=(
   device_memory_utilization_percent
   device_disk_utilization_percent
   device_uptime_seconds
+  device_report_interval_seconds   # the agent declares its own interval (docs/CONTRACT.md)
 )
 
 DO_DOWN=0
@@ -516,7 +517,7 @@ main() {
 
   # --- 6. both devices fresh, all four always-present metrics -------------
   wait_for "$ONLINE_TIMEOUT" 3 check_both_fresh && rc=0 || rc=$?
-  wait_result "Both devices report fresh (age < ${FRESH_SECONDS}s) cpu, memory, disk and uptime metrics" "$rc" "metrics did not arrive in VictoriaMetrics"
+  wait_result "Both devices report fresh (age < ${FRESH_SECONDS}s) cpu, memory, disk, uptime and report-interval metrics" "$rc" "metrics did not arrive in VictoriaMetrics"
 
   # --- 7. distinct identities --------------------------------------------
   local ident
