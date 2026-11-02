@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""fleet: start, stop and manage the multi-device monitoring stack with one command.
+
+  ./fleet up                  start everything and wait until it is ready
+  ./fleet down [--wipe]       stop everything (asks first, confirms afterwards)
+  ./fleet status              stack health and a device summary
+  ./fleet list [--json]       every device: state, last seen, readings
+  ./fleet check <id>          one device in detail
+  ./fleet add <id>            onboard a device: shows what to run on it, waits for it to appear
+  ./fleet remove <id>         forget a retired device (deletes its stored data, asks first)
+  ./fleet notify set|test|status|off   send alerts to Discord, Slack, Telegram or a webhook
+
+Run it on the machine that hosts the stack. Needs Docker with Compose v2 and Python 3.9+, nothing else.
+Demonstration tool: no authentication or TLS anywhere (see README, Known limitations).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(ROOT, "agent"))
+from device_agent import DEVICE_ID_RE, is_valid_device_id  # noqa: E402  one source of truth for the id rule
+
+VM_URL = os.environ.get("FLEET_VM_URL", "http://localhost:8428").rstrip("/")
+GRAFANA_URL = os.environ.get("FLEET_GRAFANA_URL", "http://localhost:3000").rstrip("/")
+GRAFANA_AUTH = os.environ.get("FLEET_GRAFANA_AUTH", "admin:admin")
+OTLP_PORT = 4317
+OFFLINE_AFTER = 30  # seconds without a sample; the same rule the dashboard and the alert use
+LOOKBACK = "1d"     # a device silent for longer drops out of every view
+POLL_SECONDS = 2.0
+READINGS = (
+    ("cpu", "device_cpu_utilization_percent"),
+    ("mem", "device_memory_utilization_percent"),
+    ("disk", "device_disk_utilization_percent"),
+    ("temp", "device_temperature_celsius"),
+    ("uptime", "device_uptime_seconds"),
+)
+UTF8 = (getattr(sys.stdout, "encoding", "") or "").lower().startswith("utf")
+
+
+class FleetError(Exception):
+    """A problem the user can act on; printed without a traceback."""
+
+
+# ---------------------------------------------------------------- output
+def _style(text, code):
+    if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
+        return f"\033[{code}m{text}\033[0m"
+    return text
+
+
+def green(t): return _style(t, "32")
+def red(t): return _style(t, "31")
+def yellow(t): return _style(t, "33")
+def dim(t): return _style(t, "2")
+def bold(t): return _style(t, "1")
+def tick(): return green("✓" if UTF8 else "ok")
+def cross(): return red("✗" if UTF8 else "x")
+
+
+def fmt_age(seconds):
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h"
+
+
+def fmt_pct(v): return "-" if v is None else f"{v:.1f}%"
+def fmt_temp(v): return "-" if v is None else f"{v:.1f}C"
+def fmt_dur(v): return "-" if v is None else fmt_age(v)
+
+
+def table(headers, rows, style_cell=None):
+    """Print a left-aligned table. Widths come from plain text, so colours never break alignment."""
+    widths = [max([len(h)] + [len(r[i]) for r in rows]) for i, h in enumerate(headers)]
+    last = len(widths) - 1
+    print("  " + "  ".join(dim(h if i == last else h.ljust(w)) for i, (h, w) in enumerate(zip(headers, widths))))
+    for r in rows:
+        cells = []
+        for i, (c, w) in enumerate(zip(r, widths)):
+            padded = c if i == last else c.ljust(w)  # no trailing spaces after the last column
+            cells.append(style_cell(i, c, padded) if style_cell else padded)
+        print("  " + "  ".join(cells))
+
+
+def confirm(prompt, assume_yes=False, word=None):
+    """Ask before anything destructive. With `word`, the user must type that word."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        raise FleetError("this needs your confirmation and there is no terminal to ask on; re-run with --yes")
+    answer = input(f"{prompt} ").strip().lower()
+    return answer == word if word else answer in ("y", "yes")
+
+
+# ---------------------------------------------------------------- talking to the stack
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # local services: never via a proxy
+
+
+def http(method, url, data=None, auth=None, timeout=10, headers=None):
+    req = urllib.request.Request(url, data=data, method=method)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    if auth:
+        req.add_header("Authorization", "Basic " + base64.b64encode(auth.encode()).decode())
+    try:
+        with _OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise FleetError(f"cannot reach {url}: {getattr(e, 'reason', e)}")
+
+
+def vm_healthy():
+    try:
+        status, body = http("GET", VM_URL + "/health", timeout=3)
+    except FleetError:
+        return False
+    return status == 200 and body.strip() == b"OK"
+
+
+def grafana_healthy():
+    try:
+        status, body = http("GET", GRAFANA_URL + "/api/health", timeout=3)
+        return status == 200 and json.loads(body).get("database") == "ok"
+    except (FleetError, ValueError):
+        return False
+
+
+def port_open(host, port, timeout=2):
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def dashboard_state():
+    try:
+        status, _ = http("GET", GRAFANA_URL + "/api/dashboards/uid/device-fleet", auth=GRAFANA_AUTH, timeout=5)
+    except FleetError:
+        return "unreachable"
+    return {200: "ok", 401: "login", 403: "login", 404: "missing"}.get(status, f"http {status}")
+
+
+def require_stack():
+    if not vm_healthy():
+        raise FleetError(f"the stack is not running (nothing answers at {VM_URL}). Start it with: ./fleet up")
+
+
+def prom(expr):
+    status, body = http("GET", VM_URL + "/api/v1/query?" + urllib.parse.urlencode({"query": expr}))
+    if status != 200:
+        raise FleetError(f"VictoriaMetrics answered HTTP {status}: {body[:200].decode(errors='replace')}")
+    data = json.loads(body)
+    if data.get("status") != "success":
+        raise FleetError(f"query failed: {data}")
+    return data["data"]["result"]
+
+
+def _by_device(result):
+    return {r["metric"]["device_id"]: r for r in result if "device_id" in r["metric"]}
+
+
+def fetch_devices():
+    """{device_id: info}. Same rule as the dashboard: OFFLINE when no sample for more than OFFLINE_AFTER seconds."""
+    ages = _by_device(prom(f"max by (device_id) (time() - tlast_over_time(device_uptime_seconds[{LOOKBACK}]))"))
+    seen = _by_device(prom(f"topk by (device_id) (1, tlast_over_time(device_uptime_seconds[{LOOKBACK}]))"))
+    latest = {k: _by_device(prom(f"max by (device_id) (last_over_time({m}[1m]))")) for k, m in READINGS}
+    devices = {}
+    for dev, r in ages.items():
+        age = float(r["value"][1])
+        s = seen.get(dev)
+        info = {
+            "device_id": dev,
+            "hostname": (s or {}).get("metric", {}).get("hostname", ""),
+            "state": "ONLINE" if age <= OFFLINE_AFTER else "OFFLINE",
+            "age_seconds": round(age, 1),
+            "last_seen": float(s["value"][1]) if s else None,
+        }
+        for k, _ in READINGS:
+            info[k] = float(latest[k][dev]["value"][1]) if dev in latest[k] else None
+        devices[dev] = info
+    return dict(sorted(devices.items()))
+
+
+def delete_device_data(device_id):
+    """Delete every stored series of one device. The id is validated first, so the selectors cannot be abused."""
+    selectors = [f'{{device_id="{device_id}"}}', f'{{job="device-agent",instance="{device_id}"}}']
+    body = urllib.parse.urlencode([("match[]", s) for s in selectors]).encode()
+    status, resp = http("POST", VM_URL + "/api/v1/admin/tsdb/delete_series", data=body)
+    if status not in (200, 204):
+        raise FleetError(f"VictoriaMetrics refused the delete (HTTP {status}): {resp[:200].decode(errors='replace')}")
+    try:
+        http("POST", VM_URL + "/internal/resetRollupResultCache")  # best effort: makes the removal visible at once
+    except FleetError:
+        pass
+
+
+# ---------------------------------------------------------------- talking to Docker
+def compose(*args, capture=False):
+    return subprocess.run(["docker", "compose", *args], cwd=ROOT, capture_output=capture, text=True)
+
+
+def require_docker():
+    if not shutil.which("docker"):
+        raise FleetError("docker is not installed or not on PATH. Install Docker Engine with Compose v2.")
+    if compose("version", capture=True).returncode:
+        raise FleetError("'docker compose' (v2) is not available. Install the Docker Compose plugin.")
+    if subprocess.run(["docker", "info"], capture_output=True).returncode:
+        raise FleetError("cannot talk to the Docker daemon. Is it running? On Linux you may need to be in the "
+                         "'docker' group (sudo usermod -aG docker $USER, then log in again).")
+
+
+def expected_services():
+    r = compose("config", "--services", capture=True)
+    return [s for s in r.stdout.split() if s] if r.returncode == 0 else []
+
+
+def compose_ps():
+    r = compose("ps", "-a", "--format", "{{.Service}}\t{{.State}}", capture=True)
+    out = {}
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2:
+            out[parts[0]] = parts[1]
+    return out
+
+
+def missing_images():
+    r = compose("config", "--images", capture=True)
+    if r.returncode:
+        return []
+    images = [i.strip() for i in r.stdout.splitlines() if i.strip()]
+    return [i for i in images if subprocess.run(["docker", "image", "inspect", i], capture_output=True).returncode]
+
+
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))  # UDP connect sends nothing; it only picks the outgoing interface
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def service_checks():
+    """service -> (ok, detail), for the three services the stack needs."""
+    return {
+        "victoriametrics": (vm_healthy(), "healthy"),
+        "otel-collector": (port_open("localhost", OTLP_PORT), f"port {OTLP_PORT} open"),
+        "grafana": (grafana_healthy(), "healthy"),
+    }
+
+
+# ---------------------------------------------------------------- notifications (via Grafana's own API)
+# Nothing secret is stored by this tool: webhook URLs and tokens go straight into Grafana, which keeps
+# them encrypted and can re-use them to send a test without ever showing them again.
+NOTIFY_UID = "fleet-notify"
+NOTIFY_API = "/apis/notifications.alerting.grafana.app/v1beta1/namespaces/default"
+SAFE_ROOT_RECEIVERS = ("empty", "grafana-default-email", NOTIFY_UID)  # an untouched Grafana, or ours
+NOTIFY_TYPES = {  # type -> (argument names, how they map to Grafana's settings)
+    "webhook": (("url",), lambda a: {"url": a[0]}),
+    "discord": (("webhook-url",), lambda a: {"url": a[0]}),
+    "slack": (("webhook-url",), lambda a: {"url": a[0]}),
+    "telegram": (("bot-token", "chat-id"), lambda a: {"bottoken": a[0], "chatid": a[1]}),
+}
+NEVER = "0001-01-01"  # Grafana's "no attempt yet" timestamp prefix
+
+
+def grafana(method, path, body=None):
+    """Call Grafana's API. Returns (status, parsed JSON or None); raises with advice if the login is wrong."""
+    data = json.dumps(body).encode() if body is not None else None
+    status, raw = http(method, GRAFANA_URL + path, data=data, auth=GRAFANA_AUTH, timeout=15,
+                       headers={"Content-Type": "application/json", "X-Disable-Provenance": "true"})
+    if status in (401, 403):
+        raise FleetError("Grafana refused the login (default admin / admin). If you changed the password, run with "
+                         "FLEET_GRAFANA_AUTH=admin:<your password>")
+    try:
+        return status, (json.loads(raw) if raw else None)
+    except ValueError:
+        return status, None
+
+
+def receiver_id(name):
+    return base64.urlsafe_b64encode(name.encode()).decode().rstrip("=")
+
+
+def notify_receiver():
+    """Our saved contact point as Grafana returns it (secrets stay hidden), or None."""
+    status, rec = grafana("GET", f"{NOTIFY_API}/receivers/{receiver_id(NOTIFY_UID)}")
+    return rec if status == 200 and rec else None
+
+
+def notify_configured():
+    """True / False, or None when Grafana cannot be asked (never block a command on this)."""
+    try:
+        return notify_receiver() is not None
+    except FleetError:
+        return None
+
+
+def public_address(settings):
+    """scheme://host only: webhook URLs often carry a secret in the path."""
+    parts = urllib.parse.urlparse((settings or {}).get("url", ""))
+    return f"{parts.scheme}://{parts.netloc}/..." if parts.netloc else None
+
+
+def run_notify_test():
+    """Ask Grafana to send a test through the saved contact point. Returns (ok, detail)."""
+    rec = notify_receiver()
+    if not rec:
+        raise FleetError("no notifications are set up. Run: ./fleet notify set <discord|slack|telegram|webhook> ...")
+    integ = rec["spec"]["integrations"][0]
+    body = {"integration": {k: integ[k] for k in ("uid", "type", "version", "settings", "secureFields") if k in integ}}
+    status, res = grafana("POST", f"{NOTIFY_API}/receivers/{receiver_id(NOTIFY_UID)}/test", body)
+    if status != 200 or not res:
+        raise FleetError(f"Grafana could not run the test (HTTP {status}): {(res or {}).get('message', 'no details')}")
+    if res.get("status") == "success":
+        return True, res.get("duration", "")
+    return False, res.get("error") or "no details from Grafana"
+
+
+def applied_config_id():
+    """Id of the newest alerting config Grafana has actually put into use (0 if unknown).
+    Grafana saves a change at once but only switches over on a one-minute cycle (measured: 58 to 60 s)."""
+    status, history = grafana("GET", "/api/alertmanager/grafana/config/history?limit=1")
+    return history[0]["id"] if status == 200 and history else 0
+
+
+def wait_until_applied(before, timeout=100):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if applied_config_id() > before:
+            return True
+        time.sleep(2)
+    return False
+
+
+def cmd_notify_set(args):
+    require_stack()
+    names, build = NOTIFY_TYPES[args.type]
+    values = [v.strip() for v in args.values]
+    if values and len(values) != len(names):
+        raise FleetError(f"{args.type} needs: {' '.join(names)}")
+    if not values:
+        if not sys.stdin.isatty():
+            raise FleetError(f"pass the {' and '.join(names)} as arguments (there is no terminal to ask on)")
+        values = [getpass.getpass(f"{n} (input is hidden): ").strip() for n in names]
+    if not all(values):
+        raise FleetError("empty value")
+    if names[0].endswith("url"):
+        u = urllib.parse.urlparse(values[0])
+        if u.scheme not in ("http", "https") or not u.netloc:
+            raise FleetError("that does not look like a web address (it must start with http:// or https://)")
+    status, policy = grafana("GET", "/api/v1/provisioning/policies")
+    custom = (policy or {}).get("receiver") not in SAFE_ROOT_RECEIVERS or bool((policy or {}).get("routes"))
+    if custom and not args.force:
+        raise FleetError("your Grafana notification policy has been customised, so it will not be overwritten. "
+                         "Re-run with --force to replace it (Alerting > Notification policies shows what is there).")
+    before = applied_config_id()
+    body = {"uid": NOTIFY_UID, "name": NOTIFY_UID, "type": args.type, "settings": build(values),
+            "disableResolveMessage": False}
+    if notify_configured():
+        status, res = grafana("PUT", f"/api/v1/provisioning/contact-points/{NOTIFY_UID}", body)
+    else:
+        status, res = grafana("POST", "/api/v1/provisioning/contact-points", body)
+    if status not in (200, 202):
+        raise FleetError(f"Grafana refused the contact point (HTTP {status}): {(res or {}).get('message', '')}")
+    status, res = grafana("PUT", "/api/v1/provisioning/policies",
+                          {"receiver": NOTIFY_UID, "group_by": ["alertname", "device_id"], "group_wait": "10s",
+                           "group_interval": "1m", "repeat_interval": "4h"})
+    if status not in (200, 202):
+        raise FleetError(f"saved the contact point but Grafana refused the routing (HTTP {status}): "
+                         f"{(res or {}).get('message', '')}")
+    print(f"{tick()} Saved: alerts will go to {bold(args.type)}. "
+          f"{dim('Each device alerts on its own; a recovery message follows.')}")
+    ok, detail = run_notify_test()
+    if ok:
+        print(f"{tick()} Test message accepted by the destination {dim('(' + detail + '). Check that it arrived.')}")
+    else:
+        print(f"{cross()} The test message failed: {detail}")
+        print("  Fix the address or token and run ./fleet notify set again.")
+    if args.no_wait:
+        print(dim("  Not waiting: Grafana switches over within about a minute; until then alerts use the old setting."))
+    else:
+        print(dim("  Waiting for Grafana to switch over (it applies changes on a one-minute cycle)..."))
+        if wait_until_applied(before):
+            print(f"{tick()} Active: alerts from now on go to {bold(args.type)}.")
+        else:
+            print(yellow("  Grafana has not switched over yet; it should within a minute or two. "
+                         "Check with: ./fleet notify status"))
+    return 0 if ok else 1
+
+
+def cmd_notify_test(args):
+    require_stack()
+    ok, detail = run_notify_test()
+    if ok:
+        print(f"{tick()} Test message accepted by the destination {dim('(' + detail + ')')}. "
+              "That means it was delivered to the service, not that you have seen it: check your channel.")
+        return 0
+    print(f"{cross()} The test failed: {detail}")
+    return 1
+
+
+def cmd_notify_status(args):
+    require_stack()
+    rec = notify_receiver()
+    if not rec:
+        print("Notifications: off. Alerts are visible in Grafana only.")
+        print("  Turn them on:  ./fleet notify set <discord|slack|telegram|webhook> ...")
+        return 0
+    integ = rec["spec"]["integrations"][0]
+    _, policy = grafana("GET", "/api/v1/provisioning/policies")
+    routed = (policy or {}).get("receiver") == NOTIFY_UID
+    where = public_address(integ.get("settings")) or "address stored encrypted by Grafana"
+    print(f"Notifications: {bold(integ['type'])} {dim('(' + where + ')')}")
+    print(f"  Routing      {'all alerts go to it' if routed else yellow('NOT routed: another notification policy is active')}")
+    status, receivers = grafana("GET", "/api/alertmanager/grafana/config/api/v1/receivers")
+    mine = next((r for r in (receivers or []) if r.get("name") == NOTIFY_UID), None)
+    attempt = ((mine or {}).get("integrations") or [{}])[0]
+    last = attempt.get("lastNotifyAttempt", NEVER)
+    if attempt.get("name") and attempt["name"] != integ["type"]:
+        print(yellow(f"  Change not live yet: Grafana is still using '{attempt['name']}' "
+                     "(it switches over within about a minute)."))
+    elif last.startswith(NEVER):
+        print("  Last delivery  none yet (nothing has fired since it was set up)")
+    elif attempt.get("lastNotifyAttemptError"):
+        print(f"  Last delivery  {red('FAILED')} at {last}: {attempt['lastNotifyAttemptError']}")
+    else:
+        print(f"  Last delivery  ok at {last}")
+    return 0
+
+
+def cmd_notify_off(args):
+    require_stack()
+    if not notify_receiver():
+        print("Notifications are already off.")
+        return 0
+    if not confirm("Turn notifications off? Alerts will only show in Grafana. [y/N]", args.yes):
+        print("Aborted. Nothing was changed.")
+        return 1
+    _, policy = grafana("GET", "/api/v1/provisioning/policies")
+    if (policy or {}).get("receiver") == NOTIFY_UID and not policy.get("routes"):
+        grafana("DELETE", "/api/v1/provisioning/policies")  # back to Grafana's default routing
+    status, res = grafana("DELETE", f"/api/v1/provisioning/contact-points/{NOTIFY_UID}")
+    if status not in (200, 202, 204):
+        raise FleetError(f"Grafana would not delete it (HTTP {status}): {(res or {}).get('message', '')}. "
+                         "A custom notification policy may still point at it.")
+    print(f"{tick()} Notifications are off. Alerts are visible in Grafana only.")
+    print(dim("  Grafana switches over within about a minute; an alert in that window may still be sent."))
+    return 0
+
+
+# ---------------------------------------------------------------- commands
+def cmd_up(args):
+    require_docker()
+    missing = missing_images()
+    if missing:
+        print(f"First run: downloading {len(missing)} image(s), about 590 MB in total (mostly Grafana).")
+        print(dim("  This can take several minutes. Use a connection without a data cap."))
+    started = time.time()
+    if subprocess.run(["docker", "compose", "up", "-d"], cwd=ROOT).returncode:
+        raise FleetError("'docker compose up -d' failed; see the output above.")
+    deadline = time.time() + args.timeout
+    reported = set()
+    while True:
+        pending = service_checks()
+        for name, (ok, detail) in pending.items():
+            if ok and name not in reported:
+                reported.add(name)
+                print(f"  {tick()} {name} {dim(detail)}")
+        if all(ok for ok, _ in pending.values()):
+            break
+        if time.time() > deadline:
+            bad = [n for n, (ok, _) in pending.items() if not ok]
+            raise FleetError(f"not ready after {args.timeout}s: {', '.join(bad)}. "
+                             f"See: docker compose logs {bad[0]}")
+        time.sleep(1)
+    ip = lan_ip()
+    login = dashboard_state()
+    print()
+    print(f"{tick()} {bold('Stack is up')} {dim('(%ds)' % (time.time() - started))}")
+    print()
+    print(f"  Dashboard   http://localhost:3000" + (f"   (from other machines: http://{ip}:3000)" if ip else ""))
+    if login == "ok":
+        print(f"  Login       admin / admin   {dim('(Grafana may ask for a new password: you can skip it)')}")
+    elif login == "login":
+        print("  Login       admin / the password you set")
+    print(f"  Devices report to   {(ip or 'localhost')}:{OTLP_PORT}")
+    print()
+    try:
+        n = len(fetch_devices())
+    except FleetError:
+        n = 0
+    if n == 0:
+        print("  No devices yet. Add one with:   ./fleet add <device-id>")
+    else:
+        print(f"  {n} device(s) already known.   ./fleet list")
+    if notify_configured() is False:
+        print("  Alerts show in Grafana only.    ./fleet notify set discord|slack|telegram|webhook")
+    print("  Stop everything with:           ./fleet down")
+
+
+def cmd_down(args):
+    require_docker()
+    present = compose_ps()
+    if not present and not args.wipe:
+        print("Nothing to stop: the stack is not running.")
+        return 0
+    online = 0
+    if vm_healthy():
+        try:
+            online = sum(1 for d in fetch_devices().values() if d["state"] == "ONLINE")
+        except FleetError:
+            pass
+    print("This will stop the dashboard, the collector and the database.")
+    if online:
+        print(yellow(f"  {online} device(s) are online right now and will have nowhere to report "
+                     "(their agents keep retrying until the stack is back)."))
+    if args.wipe:
+        print(red("  --wipe ALSO DELETES all stored metrics and Grafana state, including your notification "
+                  "settings. This cannot be undone."))
+    else:
+        print("  Stored metrics and Grafana state are kept.")
+    if not confirm("Stop it? [y/N]", args.yes):
+        print("Aborted. Nothing was changed.")
+        return 1
+    if args.wipe and not confirm("Type 'wipe' to delete the stored data too:", args.yes, word="wipe"):
+        print("Aborted. Nothing was changed.")
+        return 1
+    cmd = ["docker", "compose", "down"] + (["-v"] if args.wipe else [])
+    if subprocess.run(cmd, cwd=ROOT).returncode:
+        raise FleetError("'docker compose down' failed; see the output above.")
+    left = compose_ps()
+    if left:
+        raise FleetError(f"stopped, but these containers still exist: {', '.join(left)}")
+    print()
+    print(f"{tick()} {bold('Stack stopped.')} {len(present)} container(s) removed.")
+    print("  " + ("All stored metrics and Grafana state were deleted." if args.wipe
+                  else "Stored metrics and Grafana state are kept; ./fleet up brings it all back."))
+    return 0
+
+
+def cmd_status(args):
+    require_docker()
+    present = compose_ps()
+    checks = service_checks()
+    print(bold("Stack"))
+    all_ok = True
+    for name in expected_services() or sorted(checks):
+        state = present.get(name, "not created")
+        ok, detail = checks.get(name, (state == "running", state))
+        all_ok = all_ok and ok and state == "running"
+        mark = tick() if ok and state == "running" else cross()
+        note = detail if ok else ("" if state != "running" else "running but not answering")
+        print(f"  {mark} {name:<16} {state:<12} {dim(note)}".rstrip())
+    if not all_ok:
+        print()
+        print("  The stack is not fully running. Start it with: ./fleet up")
+        return 1
+    login = dashboard_state()
+    print(f"  Dashboard   http://localhost:3000   {dim({'ok': 'provisioned', 'login': 'login differs from admin/admin', 'missing': 'NOT provisioned'}.get(login, login))}")
+    devices = fetch_devices()
+    on = sum(1 for d in devices.values() if d["state"] == "ONLINE")
+    print()
+    print(f"{bold('Devices')}  {on} online, {len(devices) - on} offline   {dim('(./fleet list for details)')}")
+    configured = notify_configured()
+    if configured is not None:
+        print(f"{bold('Alerts')}   " + ("sent to your notification channel" if configured
+                                        else "visible in Grafana only   " + dim("(./fleet notify set ...)")) + "")
+    return 0
+
+
+def cmd_list(args):
+    require_stack()
+    devices = fetch_devices()
+    if args.json:
+        print(json.dumps(list(devices.values()), indent=2))
+        return 0
+    if not devices:
+        print("No device has reported in the last 24 hours.  Add one with: ./fleet add <device-id>")
+        return 0
+    rows = [[d["device_id"], d["hostname"] or "-", d["state"],
+             fmt_age(d["age_seconds"]) + " ago", fmt_pct(d["cpu"]), fmt_pct(d["mem"]),
+             fmt_pct(d["disk"]), fmt_temp(d["temp"]), fmt_dur(d["uptime"])] for d in devices.values()]
+
+    def colour(i, plain, padded):
+        if i == 2:
+            return green(padded) if plain == "ONLINE" else red(padded)
+        return padded
+
+    table(["DEVICE", "HOST", "STATE", "LAST SEEN", "CPU", "MEM", "DISK", "TEMP", "UPTIME"], rows, colour)
+    on = sum(1 for d in devices.values() if d["state"] == "ONLINE")
+    print(f"\n  {on} online, {len(devices) - on} offline")
+    return 0
+
+
+def cmd_check(args):
+    require_stack()
+    d = fetch_devices().get(args.device_id)
+    if not d:
+        raise FleetError(f"no device '{args.device_id}' has reported in the last 24 hours. See: ./fleet list")
+    state = green("ONLINE") if d["state"] == "ONLINE" else red("OFFLINE")
+    print(f"{bold(d['device_id'])}   {state}   {dim('host ' + (d['hostname'] or '-'))}")
+    seen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d["last_seen"])) if d["last_seen"] else "-"
+    print(f"  last seen   {seen}  ({fmt_age(d['age_seconds'])} ago)")
+    print(f"  CPU         {fmt_pct(d['cpu'])}")
+    print(f"  memory      {fmt_pct(d['mem'])}")
+    print(f"  disk        {fmt_pct(d['disk'])}")
+    print(f"  temperature {fmt_temp(d['temp']) if d['temp'] is not None else '- (no sensor, or not reported)'}")
+    print(f"  uptime      {fmt_dur(d['uptime'])}")
+    if d["state"] == "OFFLINE":
+        print()
+        print(f"  No data for {fmt_age(d['age_seconds'])}. Check the device's power, network and agent. "
+              f"If it is retired: ./fleet remove {d['device_id']}")
+    return 0
+
+
+def agent_path(name):
+    p = os.path.join(ROOT, "agent", name)
+    rel = os.path.relpath(p)
+    return p if rel.startswith("..") else rel
+
+
+def wait_for_device(device_id, timeout):
+    """Poll until the device reports. True when it does, False on timeout."""
+    deadline = time.time() + timeout
+    start = time.time()
+    while time.time() < deadline:
+        d = fetch_devices().get(device_id)
+        if d and d["state"] == "ONLINE":
+            if sys.stdout.isatty():
+                print(f"\r{' ' * 78}\r", end="")  # wipe the "waiting..." line
+            print(f"{tick()} {bold(device_id)} is online after {int(time.time() - start)}s "
+                  f"{dim('(CPU ' + fmt_pct(d['cpu']) + ', memory ' + fmt_pct(d['mem']) + ', temp ' + fmt_temp(d['temp']) + ')')}")
+            return True
+        if sys.stdout.isatty():
+            print(f"\r  waiting for '{device_id}' to report... {int(time.time() - start)}s (Ctrl+C to stop waiting)", end="", flush=True)
+        time.sleep(POLL_SECONDS)
+    print()
+    return False
+
+
+def cmd_add(args):
+    require_stack()
+    existing = fetch_devices().get(args.device_id)
+    if existing and existing["state"] == "ONLINE":
+        raise FleetError(f"'{args.device_id}' is already reporting (last seen {fmt_age(existing['age_seconds'])} ago). "
+                         "Two devices with the same ID overwrite each other: pick another ID.")
+    host = args.host or lan_ip() or "localhost"
+    endpoint = f"{host}:{OTLP_PORT}"
+    print(bold(f"Add device '{args.device_id}'"))
+    if existing:
+        print(yellow(f"  Note: '{args.device_id}' reported before (offline for {fmt_age(existing['age_seconds'])}). "
+                     "If this is the same device, just start its agent again."))
+    print()
+    print("On the device (Linux with Python 3.9+; a Raspberry Pi is fine):")
+    print()
+    print("  1. Copy the agent to it. Run this here, replacing USER and DEVICE:")
+    print(f"       scp {agent_path('device_agent.py')} {agent_path('requirements.txt')} USER@DEVICE:")
+    print()
+    print("  2. Run this ON THE DEVICE:")
+    print("       python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt")
+    print(f"       python device_agent.py --device-id {args.device_id} --endpoint {endpoint}")
+    print()
+    print(f"  The device must be able to reach {endpoint}.")
+    print(dim("  If the device is THIS machine instead, run from the repo folder:"))
+    print(dim("       python3 -m venv .venv && . .venv/bin/activate && pip install -r agent/requirements.txt"))
+    print(dim(f"       python agent/device_agent.py --device-id {args.device_id}"))
+    print()
+    print(dim("  The agent is not set up to start at boot: after a reboot, start it again."))
+    if host != "localhost" and not args.host:
+        print(dim(f"  If this machine's address ({host}) can change (DHCP, phone hotspot), devices will stop "
+                  "reporting; reserve the address in your router, or pass --host with a stable name."))
+    if args.no_wait:
+        return 0
+    print()
+    try:
+        if wait_for_device(args.device_id, args.timeout):
+            print(f"  See it: ./fleet check {args.device_id}")
+            return 0
+    except KeyboardInterrupt:
+        print("\nStopped waiting. The device will still appear as soon as it reports.")
+        return 0
+    print(yellow(f"Gave up waiting after {args.timeout}s. It will still appear once it reports."))
+    print(f"  Not showing up? On the device, test the path:  python3 -c \"import socket; "
+          f"socket.create_connection(('{host}', {OTLP_PORT}), 3); print('reachable')\"")
+    return 1
+
+
+def cmd_remove(args):
+    require_stack()
+    d = fetch_devices().get(args.device_id)
+    if not d:
+        raise FleetError(f"no device '{args.device_id}' has reported in the last 24 hours, so there is nothing to remove. "
+                         "See: ./fleet list")
+    if d["state"] == "ONLINE" and not args.force:
+        raise FleetError(f"'{args.device_id}' is reporting right now (last seen {fmt_age(d['age_seconds'])} ago). "
+                         "Stop its agent first, or pass --force to delete anyway (it comes back on its next report).")
+    print(f"This deletes ALL stored data for '{args.device_id}' (last seen {fmt_age(d['age_seconds'])} ago). "
+          "It cannot be undone.")
+    if not confirm("Delete it? [y/N]", args.yes):
+        print("Aborted. Nothing was changed.")
+        return 1
+    delete_device_data(args.device_id)
+    for _ in range(10):
+        if args.device_id not in fetch_devices():
+            print(f"{tick()} {bold('Removed')} '{args.device_id}'. It is gone from ./fleet list and the dashboard table, "
+                  "and any alert for it clears within about half a minute.")
+            return 0
+        time.sleep(1)
+    print(yellow(f"Deleted, but '{args.device_id}' is still visible (a cache). It should disappear within a minute."))
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+def device_id_arg(value):
+    if not is_valid_device_id(value):
+        raise argparse.ArgumentTypeError(
+            f"invalid device id {value!r}: use lowercase letters, digits, '.', '_' and '-' "
+            f"(must match {DEVICE_ID_RE.pattern})")
+    return value
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="fleet", description="Run and manage the multi-device monitoring stack.",
+                                epilog="Run 'fleet <command> --help' for a command's options.")
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+
+    s = sub.add_parser("up", help="start everything and wait until it is ready")
+    s.add_argument("--timeout", type=int, default=120, help="seconds to wait for the services after start (default 120)")
+    s.set_defaults(func=cmd_up)
+
+    s = sub.add_parser("down", help="stop everything (asks first)")
+    s.add_argument("--wipe", action="store_true", help="ALSO delete all stored metrics and Grafana state")
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    s.set_defaults(func=cmd_down)
+
+    s = sub.add_parser("status", help="stack health and a device summary")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("list", help="all devices with state and readings")
+    s.add_argument("--json", action="store_true", help="machine-readable output")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("check", help="one device in detail")
+    s.add_argument("device_id", metavar="id", type=device_id_arg)
+    s.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("add", help="onboard a device: shows what to run on it, waits for it to appear")
+    s.add_argument("device_id", metavar="id", type=device_id_arg)
+    s.add_argument("--host", help="address devices should use to reach this machine (default: detected LAN address)")
+    s.add_argument("--no-wait", action="store_true", help="print the instructions and exit")
+    s.add_argument("--timeout", type=int, default=180, help="seconds to wait for the device (default 180)")
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("remove", help="forget a retired device (deletes its stored data)")
+    s.add_argument("device_id", metavar="id", type=device_id_arg)
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    s.add_argument("--force", action="store_true", help="delete even if the device is reporting right now")
+    s.set_defaults(func=cmd_remove)
+
+    n = sub.add_parser("notify", help="send alerts to Discord, Slack, Telegram or a webhook")
+    nsub = n.add_subparsers(dest="notify_cmd", metavar="<action>")
+    s = nsub.add_parser("set", help="choose where alerts go (the address or token goes straight into Grafana)")
+    s.add_argument("type", choices=sorted(NOTIFY_TYPES), help="where to send alerts")
+    s.add_argument("values", nargs="*", metavar="value",
+                   help="webhook URL (discord, slack, webhook) or '<bot-token> <chat-id>' (telegram); "
+                        "leave out to be asked, with the input hidden")
+    s.add_argument("--force", action="store_true", help="replace a notification policy you customised in Grafana")
+    s.add_argument("--no-wait", action="store_true", help="do not wait (about a minute) for Grafana to switch over")
+    s.set_defaults(func=cmd_notify_set)
+    s = nsub.add_parser("test", help="send a test message through the saved destination")
+    s.set_defaults(func=cmd_notify_test)
+    s = nsub.add_parser("status", help="where alerts go and whether the last delivery worked")
+    s.set_defaults(func=cmd_notify_status)
+    s = nsub.add_parser("off", help="stop sending alerts anywhere (they stay visible in Grafana)")
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    s.set_defaults(func=cmd_notify_off)
+    n.set_defaults(func=lambda a: n.print_help() or 0)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.cmd:
+        parser.print_help()
+        return 0
+    try:
+        return args.func(args) or 0
+    except FleetError as e:
+        print(f"{red('error:')} {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
+    except BrokenPipeError:  # e.g. `./fleet list | head -1`: the reader left early; not an error
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

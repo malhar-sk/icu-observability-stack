@@ -1,30 +1,42 @@
-version: "3.8"
-
 services:
   victoriametrics:
-    image: victoriametrics/victoria-metrics:latest
+    image: victoriametrics/victoria-metrics:v1.155.0
+    command:
+      # Persist data in the mounted volume (the image default path is not /storage).
+      - "-storageDataPath=/storage"
+      # Default is 30s, which hides new devices and delays offline detection.
+      - "-search.latencyOffset=5s"
     ports:
       - "8428:8428"
     volumes:
       - vm_data:/storage
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.3.0
     ports:
       - "3000:3000"
+    environment:
+      # Open the fleet dashboard on login.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/device-fleet.json
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
+    image: otel/opentelemetry-collector-contrib:0.164.0
     volumes:
       - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml
     ports:
       - "4317:4317"
       - "4318:4318"
 
+  # Not started by default: this demo pipeline is currently broken (the image reads
+  # /etc/vector/vector.yaml, and the config wires log events into a metrics sink).
+  # Start explicitly with: docker compose --profile legacy-vector up -d
   vector:
-    image: timberio/vector:latest-debian
+    profiles: ["legacy-vector"]
+    image: timberio/vector:0.61.0-debian
     volumes:
       - ./vector.toml:/etc/vector/vector.toml
     ports:
