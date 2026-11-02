@@ -1,6 +1,6 @@
 # Validation report
 
-Four runs. Run D tested the `./fleet` helper (see its own section below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+Five runs. Run D tested the `./fleet` helper and run E its `notify` command (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
 **Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
 commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
 the server over the network**; see the items marked PARTIAL and the "Not validated" list.
@@ -95,6 +95,29 @@ Bugs the live run found that the fake-server tests missed, all fixed: stray spac
 into non-terminal output, a trailing space after the last table column, and "not answering" printed for
 services that did not exist.
 
+## Run E: `./fleet notify` (x86_64, real Grafana 13.3.0, run by an AI agent)
+
+Tested against the real Grafana, with a small local web server standing in for the destination.
+**Not tested against the real Discord, Slack or Telegram services, and not on the Raspberry Pi.**
+
+| Check | Result | Evidence |
+|---|---|---|
+| `notify set webhook` | PASS | Contact point and routing created, test message accepted, and the listener received it at the right path. |
+| A real alert, end to end | PASS | Device stopped: a **firing** message arrived **79 s** later (device id and "has not reported for 64 s" in it). Device restarted: a **resolved** message arrived **59 s** later. `notify status` then reported `Last delivery ok` with the real time. |
+| Secret handling | PASS | A URL with a secret in its path appeared 0 times in `fleet`'s output or anywhere in the repo; `status` shows scheme and host only. `test` re-uses the secret Grafana saved: a Slack test reached the secret path without it being sent again. |
+| Slack and Discord | PARTIAL | Changing destination type (the update path) works, and each message reached a local listener in that service's own format (Slack: `attachments`, `username`; Discord: `content`, `embeds`, `username`). The real services were not contacted. |
+| Telegram | PARTIAL | Settings accepted. Delivery could not be tested: this machine cannot resolve `api.telegram.org`. The failure was reported clearly (exit 1), and Grafana redacted the token in the error. |
+| Switch-over delay | FINDING | Grafana saves a change at once but applies it on a **one-minute cycle** (57.8, 59.9 and 59.9 s measured). Until then alerts use the old setting, and its test already passes. `set` now waits for Grafana's applied-config history to gain a new entry; when it returned, the running config matched. `--no-wait` says the old setting is still live, and `status` shows "Change not live yet". |
+| Guard for a customised policy | PASS | A policy with its own routes was refused and left untouched; `--force` replaced it. |
+| `notify off` | PASS | In a real terminal: `n` aborted; `y` removed the contact point and restored Grafana's default routing; a second `off` was harmless. |
+| Settings across `down` and `up` | PASS | Still configured and live right after a restart. `--wipe` deletes them, and its warning says so. |
+| Wrong Grafana password | PASS | Clear advice (`FLEET_GRAFANA_AUTH`), exit 1. |
+| Unit tests | PASS | `tests/test_fleet_notify.py`: 34 tests against a fake Grafana whose behaviour was copied from the real one; 99 tests pass in total. |
+
+Bugs the work found, all fixed: `set` said "Alerts now go to X" before Grafana had switched over;
+`./fleet ... | head` printed a `BrokenPipeError` traceback; and a test fixture that made one test wait out
+a 100 s timeout.
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -105,7 +128,7 @@ services that did not exist.
 | 4 | Health metrics visible | PASS | CPU, memory, disk, uptime visible for each device. Temperature: on a **real Pi 5 sensor** it showed 48.0 °C, later 46.3 to 46.9 °C (run C). The x86 VM has no sensor, so there it was checked with the real agent code reading a **fake** sysfs directory: 52.5 °C for that device and "N/A" for the sensorless ones ([04](img/04-temperature-mixed-fleet.png)). The temperature column is absent when no device reports one. |
 | 5 | Last-seen updates | PASS | The same online device showed last seen 06:22:44, then 06:24:49, then 06:26:19 in three screenshots taken minutes apart. |
 | 6 | Offline is distinguishable | PASS | `demo-pi-2` turned red OFFLINE with last seen equal to the stop time while `demo-pi-1` stayed green ([02](img/02-demo-pi-2-offline.png)). Measured 36.2 s (manual) and 36 s (`validate.sh`) on x86; 38 s on the Pi 5 (run C). |
-| 7 | Alert works | PASS | `DeviceOffline` (Provisioned) Firing for the silent device only; `demo-pi-1` Normal ([03](img/03-alert-firing-for-silent-device.png)). Measured 69 s (manual), 71 s (`validate.sh`); Pending seen on the way. Recovery to Normal 12.1 s after restart. On the Pi 5 (run C): Alerting 74 s after the device's last sample, dashboard back to ONLINE within 17 s of restarting; the alert returning to Normal was not observed there. No notification is sent: no contact point is configured. |
+| 7 | Alert works | PASS | `DeviceOffline` (Provisioned) Firing for the silent device only; `demo-pi-1` Normal ([03](img/03-alert-firing-for-silent-device.png)). Measured 69 s (manual), 71 s (`validate.sh`); Pending seen on the way. Recovery to Normal 12.1 s after restart. On the Pi 5 (run C): Alerting 74 s after the device's last sample, dashboard back to ONLINE within 17 s of restarting; the alert returning to Normal was not observed there. By default no notification is sent; `./fleet notify` adds one (run E). |
 | 8 | Quickstart tested | PARTIAL | The README commands were executed verbatim in a fresh clone by an agent (run B), and by a person on a Pi 5 (run C) who reached the firing alert. The person had an AI giving the steps one at a time, so a cold read of the README alone is still untested. The clones used `-b claude/happy-franklin-k77hxk` because the branch is not merged to `main`; **the README's plain `git clone` fetches `main`, which does not contain this work yet**. |
 | 9 | Changes committed | PASS | Committed and pushed to `claude/happy-franklin-k77hxk`; `git status` is clean after the commit that adds this file (`git log` lists it). |
 
@@ -155,6 +178,7 @@ rendered dashboard; that was checked separately with screenshots.
 | 10 | Grafana asks for a new password on first login; one user changed it and then could not log in. | Low | Fixed in the README (troubleshooting entry with the reset command). The command was tested on Grafana 13.3.0 in a container, and the owner then logged in on the Pi. |
 | 11 | If the server's IP changes (DHCP, or a phone hotspot that picks a new subnet), devices silently stop reporting. | Medium | Documented in the README. No code change; a reservation or hostname is the fix. |
 | 12 | The agents ran in SSH sessions, so closing the session stops them and the alert then fires. No start-at-boot setup is provided. | Low | Documented as out of scope in the README. |
+| 13 | Grafana applies a changed notification setting only on a one-minute cycle, so right after a change alerts still use the old one. | Medium | Measured (about 58 to 60 s). `fleet notify set` waits for the switch-over, `--no-wait` and `status` say so, and the README explains it. |
 
 ## Not validated
 
@@ -164,5 +188,5 @@ rendered dashboard; that was checked separately with screenshots.
 - Agents resuming after a long outage of the stack (only about half a minute was tested).
 - A person following the README cold, without step-by-step help.
 - The alert returning to Normal on the Pi (seen only on x86).
-- Notification delivery (none is configured).
+- Notifications reaching the real Discord, Slack or Telegram services, email, repeat messages after the 4-hour repeat interval, flapping devices, and `notify` on the Raspberry Pi.
 - Behaviour with more than a handful of devices, long retention, or agents restarting across reboots.

@@ -41,6 +41,7 @@ One helper, `./fleet`, runs everything below. Use it on the machine that hosts t
 | `./fleet check <id>` | One device in detail |
 | `./fleet add <id>` | Onboard a device: prints what to run on it and waits until it appears |
 | `./fleet remove <id>` | Forget a retired device (deletes its stored data, asks first) |
+| `./fleet notify set\|test\|status\|off` | Send alerts to Discord, Slack, Telegram or a webhook |
 
 It is a thin wrapper around `docker compose` and the stack's own APIs, so the plain commands still
 work; they are listed [at the end of this section](#without-the-helper).
@@ -114,6 +115,38 @@ Press **Ctrl+C** in the `demo-pi-2` terminal.
   about 70 seconds after you stopped the agent; `demo-pi-1` stays **Normal**.
 - Start `demo-pi-2` again: it returns to ONLINE and the alert instance goes back to Normal
   within roughly 20 s (the rule is evaluated every 10 s).
+
+### Alerts that reach you (optional)
+
+Out of the box, an offline device only shows up if you open Grafana. To get a message instead:
+
+```bash
+./fleet notify set discord                   # asks for the webhook URL, with the input hidden
+./fleet notify set slack https://hooks.slack.com/services/...
+./fleet notify set telegram <bot-token> <chat-id>
+./fleet notify set webhook https://your.service/endpoint   # anything that accepts a JSON POST
+```
+
+`set` hands the address to Grafana (which stores it encrypted; `fleet` never keeps it), sends a test
+message, and then **waits until Grafana has switched over**. That takes up to about a minute, because
+Grafana applies alerting changes on a one-minute cycle; until then alerts still use the old setting.
+After that:
+
+```bash
+./fleet notify test      # send another test message
+./fleet notify status    # where alerts go, and whether the last real delivery worked
+./fleet notify off       # stop sending (alerts stay visible in Grafana)
+```
+
+You get one message per device when it goes offline and a recovery message when it is back. In testing
+the offline message arrived about 80 s after the device stopped, and the recovery message about a
+minute after it returned. If you already customised Grafana's notification policy, `set` refuses to
+overwrite it unless you add `--force`.
+
+**What was tested:** a real alert delivered end to end to a webhook, and the message formats for Slack
+and Discord checked against a local listener, not the real services. Telegram's delivery could not be
+tested (the test machine could not reach it); its failure message was. Email is not covered by this
+command. See [docs/VALIDATION.md](docs/VALIDATION.md), Run E.
 
 ### 6. Retire a device
 
@@ -246,8 +279,8 @@ shown, and a device that has never reported is invisible (there is no device reg
 It needs the device to have reported at least once and then be silent for more than 30 s, plus a
 30 s pending period; allow about a minute after stopping the agent. A device with no data at all
 does not raise an alert. Look under Alerting, Alert rules, *Device Fleet*, `DeviceOffline` for the
-per-device state (Normal / Pending / Firing). No notifications (email, chat) are configured; the
-alert is only visible in Grafana.
+per-device state (Normal / Pending / Firing). Unless you ran `./fleet notify set ...`, no message is
+sent anywhere; the alert is only visible in Grafana.
 
 **A port is already in use (`docker compose up` fails).**
 Find the owner with `ss -ltnp | grep -E ':(3000|4317|4318|8428)\b'` and stop it, or change the left
@@ -309,7 +342,7 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 - **No authentication or TLS** anywhere: agents send plaintext gRPC and anyone who can reach port 4317 can inject data. Grafana uses `admin` / `admin`.
 - **No device registry.** A device that has never reported is invisible, and a device silent for more than a day drops off the dashboard. That is why `./fleet add` cannot "create" a device on the server: a device exists once it reports.
 - **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there, and agents do not start at boot. `./fleet` was tested on x86_64 Linux; it has not been run on the Raspberry Pi.
-- **No notifications.** No contact point is configured, so an alert is visible only inside Grafana (and its API).
+- **Notifications are opt-in.** Until you run `./fleet notify set ...`, an alert is visible only inside Grafana (and its API). `fleet notify` covers Discord, Slack, Telegram and webhooks, not email, and only the webhook path was tested end to end.
 - **Offline detection is not instant.** It needs a push every 5 s and takes about a minute from the device stopping to the alert firing.
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
 - **Single node, demo scale.** One VictoriaMetrics, one Collector, one Grafana, no redundancy or retention tuning.

@@ -8,6 +8,7 @@
   ./fleet check <id>          one device in detail
   ./fleet add <id>            onboard a device: shows what to run on it, waits for it to appear
   ./fleet remove <id>         forget a retired device (deletes its stored data, asks first)
+  ./fleet notify set|test|status|off   send alerts to Discord, Slack, Telegram or a webhook
 
 Run it on the machine that hosts the stack. Needs Docker with Compose v2 and Python 3.9+, nothing else.
 Demonstration tool: no authentication or TLS anywhere (see README, Known limitations).
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import json
 import os
 import shutil
@@ -114,8 +116,10 @@ def confirm(prompt, assume_yes=False, word=None):
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # local services: never via a proxy
 
 
-def http(method, url, data=None, auth=None, timeout=10):
+def http(method, url, data=None, auth=None, timeout=10, headers=None):
     req = urllib.request.Request(url, data=data, method=method)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
     if auth:
         req.add_header("Authorization", "Basic " + base64.b64encode(auth.encode()).decode())
     try:
@@ -271,6 +275,206 @@ def service_checks():
     }
 
 
+# ---------------------------------------------------------------- notifications (via Grafana's own API)
+# Nothing secret is stored by this tool: webhook URLs and tokens go straight into Grafana, which keeps
+# them encrypted and can re-use them to send a test without ever showing them again.
+NOTIFY_UID = "fleet-notify"
+NOTIFY_API = "/apis/notifications.alerting.grafana.app/v1beta1/namespaces/default"
+SAFE_ROOT_RECEIVERS = ("empty", "grafana-default-email", NOTIFY_UID)  # an untouched Grafana, or ours
+NOTIFY_TYPES = {  # type -> (argument names, how they map to Grafana's settings)
+    "webhook": (("url",), lambda a: {"url": a[0]}),
+    "discord": (("webhook-url",), lambda a: {"url": a[0]}),
+    "slack": (("webhook-url",), lambda a: {"url": a[0]}),
+    "telegram": (("bot-token", "chat-id"), lambda a: {"bottoken": a[0], "chatid": a[1]}),
+}
+NEVER = "0001-01-01"  # Grafana's "no attempt yet" timestamp prefix
+
+
+def grafana(method, path, body=None):
+    """Call Grafana's API. Returns (status, parsed JSON or None); raises with advice if the login is wrong."""
+    data = json.dumps(body).encode() if body is not None else None
+    status, raw = http(method, GRAFANA_URL + path, data=data, auth=GRAFANA_AUTH, timeout=15,
+                       headers={"Content-Type": "application/json", "X-Disable-Provenance": "true"})
+    if status in (401, 403):
+        raise FleetError("Grafana refused the login (default admin / admin). If you changed the password, run with "
+                         "FLEET_GRAFANA_AUTH=admin:<your password>")
+    try:
+        return status, (json.loads(raw) if raw else None)
+    except ValueError:
+        return status, None
+
+
+def receiver_id(name):
+    return base64.urlsafe_b64encode(name.encode()).decode().rstrip("=")
+
+
+def notify_receiver():
+    """Our saved contact point as Grafana returns it (secrets stay hidden), or None."""
+    status, rec = grafana("GET", f"{NOTIFY_API}/receivers/{receiver_id(NOTIFY_UID)}")
+    return rec if status == 200 and rec else None
+
+
+def notify_configured():
+    """True / False, or None when Grafana cannot be asked (never block a command on this)."""
+    try:
+        return notify_receiver() is not None
+    except FleetError:
+        return None
+
+
+def public_address(settings):
+    """scheme://host only: webhook URLs often carry a secret in the path."""
+    parts = urllib.parse.urlparse((settings or {}).get("url", ""))
+    return f"{parts.scheme}://{parts.netloc}/..." if parts.netloc else None
+
+
+def run_notify_test():
+    """Ask Grafana to send a test through the saved contact point. Returns (ok, detail)."""
+    rec = notify_receiver()
+    if not rec:
+        raise FleetError("no notifications are set up. Run: ./fleet notify set <discord|slack|telegram|webhook> ...")
+    integ = rec["spec"]["integrations"][0]
+    body = {"integration": {k: integ[k] for k in ("uid", "type", "version", "settings", "secureFields") if k in integ}}
+    status, res = grafana("POST", f"{NOTIFY_API}/receivers/{receiver_id(NOTIFY_UID)}/test", body)
+    if status != 200 or not res:
+        raise FleetError(f"Grafana could not run the test (HTTP {status}): {(res or {}).get('message', 'no details')}")
+    if res.get("status") == "success":
+        return True, res.get("duration", "")
+    return False, res.get("error") or "no details from Grafana"
+
+
+def applied_config_id():
+    """Id of the newest alerting config Grafana has actually put into use (0 if unknown).
+    Grafana saves a change at once but only switches over on a one-minute cycle (measured: 58 to 60 s)."""
+    status, history = grafana("GET", "/api/alertmanager/grafana/config/history?limit=1")
+    return history[0]["id"] if status == 200 and history else 0
+
+
+def wait_until_applied(before, timeout=100):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if applied_config_id() > before:
+            return True
+        time.sleep(2)
+    return False
+
+
+def cmd_notify_set(args):
+    require_stack()
+    names, build = NOTIFY_TYPES[args.type]
+    values = [v.strip() for v in args.values]
+    if values and len(values) != len(names):
+        raise FleetError(f"{args.type} needs: {' '.join(names)}")
+    if not values:
+        if not sys.stdin.isatty():
+            raise FleetError(f"pass the {' and '.join(names)} as arguments (there is no terminal to ask on)")
+        values = [getpass.getpass(f"{n} (input is hidden): ").strip() for n in names]
+    if not all(values):
+        raise FleetError("empty value")
+    if names[0].endswith("url"):
+        u = urllib.parse.urlparse(values[0])
+        if u.scheme not in ("http", "https") or not u.netloc:
+            raise FleetError("that does not look like a web address (it must start with http:// or https://)")
+    status, policy = grafana("GET", "/api/v1/provisioning/policies")
+    custom = (policy or {}).get("receiver") not in SAFE_ROOT_RECEIVERS or bool((policy or {}).get("routes"))
+    if custom and not args.force:
+        raise FleetError("your Grafana notification policy has been customised, so it will not be overwritten. "
+                         "Re-run with --force to replace it (Alerting > Notification policies shows what is there).")
+    before = applied_config_id()
+    body = {"uid": NOTIFY_UID, "name": NOTIFY_UID, "type": args.type, "settings": build(values),
+            "disableResolveMessage": False}
+    if notify_configured():
+        status, res = grafana("PUT", f"/api/v1/provisioning/contact-points/{NOTIFY_UID}", body)
+    else:
+        status, res = grafana("POST", "/api/v1/provisioning/contact-points", body)
+    if status not in (200, 202):
+        raise FleetError(f"Grafana refused the contact point (HTTP {status}): {(res or {}).get('message', '')}")
+    status, res = grafana("PUT", "/api/v1/provisioning/policies",
+                          {"receiver": NOTIFY_UID, "group_by": ["alertname", "device_id"], "group_wait": "10s",
+                           "group_interval": "1m", "repeat_interval": "4h"})
+    if status not in (200, 202):
+        raise FleetError(f"saved the contact point but Grafana refused the routing (HTTP {status}): "
+                         f"{(res or {}).get('message', '')}")
+    print(f"{tick()} Saved: alerts will go to {bold(args.type)}. "
+          f"{dim('Each device alerts on its own; a recovery message follows.')}")
+    ok, detail = run_notify_test()
+    if ok:
+        print(f"{tick()} Test message accepted by the destination {dim('(' + detail + '). Check that it arrived.')}")
+    else:
+        print(f"{cross()} The test message failed: {detail}")
+        print("  Fix the address or token and run ./fleet notify set again.")
+    if args.no_wait:
+        print(dim("  Not waiting: Grafana switches over within about a minute; until then alerts use the old setting."))
+    else:
+        print(dim("  Waiting for Grafana to switch over (it applies changes on a one-minute cycle)..."))
+        if wait_until_applied(before):
+            print(f"{tick()} Active: alerts from now on go to {bold(args.type)}.")
+        else:
+            print(yellow("  Grafana has not switched over yet; it should within a minute or two. "
+                         "Check with: ./fleet notify status"))
+    return 0 if ok else 1
+
+
+def cmd_notify_test(args):
+    require_stack()
+    ok, detail = run_notify_test()
+    if ok:
+        print(f"{tick()} Test message accepted by the destination {dim('(' + detail + ')')}. "
+              "That means it was delivered to the service, not that you have seen it: check your channel.")
+        return 0
+    print(f"{cross()} The test failed: {detail}")
+    return 1
+
+
+def cmd_notify_status(args):
+    require_stack()
+    rec = notify_receiver()
+    if not rec:
+        print("Notifications: off. Alerts are visible in Grafana only.")
+        print("  Turn them on:  ./fleet notify set <discord|slack|telegram|webhook> ...")
+        return 0
+    integ = rec["spec"]["integrations"][0]
+    _, policy = grafana("GET", "/api/v1/provisioning/policies")
+    routed = (policy or {}).get("receiver") == NOTIFY_UID
+    where = public_address(integ.get("settings")) or "address stored encrypted by Grafana"
+    print(f"Notifications: {bold(integ['type'])} {dim('(' + where + ')')}")
+    print(f"  Routing      {'all alerts go to it' if routed else yellow('NOT routed: another notification policy is active')}")
+    status, receivers = grafana("GET", "/api/alertmanager/grafana/config/api/v1/receivers")
+    mine = next((r for r in (receivers or []) if r.get("name") == NOTIFY_UID), None)
+    attempt = ((mine or {}).get("integrations") or [{}])[0]
+    last = attempt.get("lastNotifyAttempt", NEVER)
+    if attempt.get("name") and attempt["name"] != integ["type"]:
+        print(yellow(f"  Change not live yet: Grafana is still using '{attempt['name']}' "
+                     "(it switches over within about a minute)."))
+    elif last.startswith(NEVER):
+        print("  Last delivery  none yet (nothing has fired since it was set up)")
+    elif attempt.get("lastNotifyAttemptError"):
+        print(f"  Last delivery  {red('FAILED')} at {last}: {attempt['lastNotifyAttemptError']}")
+    else:
+        print(f"  Last delivery  ok at {last}")
+    return 0
+
+
+def cmd_notify_off(args):
+    require_stack()
+    if not notify_receiver():
+        print("Notifications are already off.")
+        return 0
+    if not confirm("Turn notifications off? Alerts will only show in Grafana. [y/N]", args.yes):
+        print("Aborted. Nothing was changed.")
+        return 1
+    _, policy = grafana("GET", "/api/v1/provisioning/policies")
+    if (policy or {}).get("receiver") == NOTIFY_UID and not policy.get("routes"):
+        grafana("DELETE", "/api/v1/provisioning/policies")  # back to Grafana's default routing
+    status, res = grafana("DELETE", f"/api/v1/provisioning/contact-points/{NOTIFY_UID}")
+    if status not in (200, 202, 204):
+        raise FleetError(f"Grafana would not delete it (HTTP {status}): {(res or {}).get('message', '')}. "
+                         "A custom notification policy may still point at it.")
+    print(f"{tick()} Notifications are off. Alerts are visible in Grafana only.")
+    print(dim("  Grafana switches over within about a minute; an alert in that window may still be sent."))
+    return 0
+
+
 # ---------------------------------------------------------------- commands
 def cmd_up(args):
     require_docker()
@@ -316,6 +520,8 @@ def cmd_up(args):
         print("  No devices yet. Add one with:   ./fleet add <device-id>")
     else:
         print(f"  {n} device(s) already known.   ./fleet list")
+    if notify_configured() is False:
+        print("  Alerts show in Grafana only.    ./fleet notify set discord|slack|telegram|webhook")
     print("  Stop everything with:           ./fleet down")
 
 
@@ -336,7 +542,8 @@ def cmd_down(args):
         print(yellow(f"  {online} device(s) are online right now and will have nowhere to report "
                      "(their agents keep retrying until the stack is back)."))
     if args.wipe:
-        print(red("  --wipe ALSO DELETES all stored metrics and Grafana state. This cannot be undone."))
+        print(red("  --wipe ALSO DELETES all stored metrics and Grafana state, including your notification "
+                  "settings. This cannot be undone."))
     else:
         print("  Stored metrics and Grafana state are kept.")
     if not confirm("Stop it? [y/N]", args.yes):
@@ -381,6 +588,10 @@ def cmd_status(args):
     on = sum(1 for d in devices.values() if d["state"] == "ONLINE")
     print()
     print(f"{bold('Devices')}  {on} online, {len(devices) - on} offline   {dim('(./fleet list for details)')}")
+    configured = notify_configured()
+    if configured is not None:
+        print(f"{bold('Alerts')}   " + ("sent to your notification channel" if configured
+                                        else "visible in Grafana only   " + dim("(./fleet notify set ...)")) + "")
     return 0
 
 
@@ -572,6 +783,25 @@ def build_parser():
     s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     s.add_argument("--force", action="store_true", help="delete even if the device is reporting right now")
     s.set_defaults(func=cmd_remove)
+
+    n = sub.add_parser("notify", help="send alerts to Discord, Slack, Telegram or a webhook")
+    nsub = n.add_subparsers(dest="notify_cmd", metavar="<action>")
+    s = nsub.add_parser("set", help="choose where alerts go (the address or token goes straight into Grafana)")
+    s.add_argument("type", choices=sorted(NOTIFY_TYPES), help="where to send alerts")
+    s.add_argument("values", nargs="*", metavar="value",
+                   help="webhook URL (discord, slack, webhook) or '<bot-token> <chat-id>' (telegram); "
+                        "leave out to be asked, with the input hidden")
+    s.add_argument("--force", action="store_true", help="replace a notification policy you customised in Grafana")
+    s.add_argument("--no-wait", action="store_true", help="do not wait (about a minute) for Grafana to switch over")
+    s.set_defaults(func=cmd_notify_set)
+    s = nsub.add_parser("test", help="send a test message through the saved destination")
+    s.set_defaults(func=cmd_notify_test)
+    s = nsub.add_parser("status", help="where alerts go and whether the last delivery worked")
+    s.set_defaults(func=cmd_notify_status)
+    s = nsub.add_parser("off", help="stop sending alerts anywhere (they stay visible in Grafana)")
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    s.set_defaults(func=cmd_notify_off)
+    n.set_defaults(func=lambda a: n.print_help() or 0)
     return p
 
 
@@ -589,6 +819,12 @@ def main(argv=None):
     except KeyboardInterrupt:
         print()
         return 130
+    except BrokenPipeError:  # e.g. `./fleet list | head -1`: the reader left early; not an error
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        return 0
 
 
 if __name__ == "__main__":
