@@ -42,6 +42,7 @@ append a suffix. Units are part of the name. Every data point carries the labels
 | `device_disk_utilization_percent` | `used / (used + avail)` of `--disk-path` (default `/`), as `df` reports it | 0-100 |
 | `device_uptime_seconds` | Seconds since boot (`/proc/uptime`) | >= 0 |
 | `device_temperature_celsius` | Hottest readable `/sys/class/thermal/thermal_zone*/temp` (millidegrees / 1000); values outside -40..150 are ignored | |
+| `device_report_interval_seconds` | **Optional.** How often this device promises to report. Sets how long it may stay quiet before it counts as OFFLINE (see below). The Linux agent sends its `--interval`. | > 0 |
 
 Rules:
 
@@ -50,7 +51,9 @@ Rules:
   without a reading shows "N/A" once at least one device reports a temperature;
   if none does, the temperature column is not shown.
 - **Liveness metric is `device_uptime_seconds`.** It is always emitted, so it
-  defines "last seen". Every other metric may be missing.
+  defines "last seen". Every other metric may be missing, including
+  `device_report_interval_seconds`. A device that reports an interval but no
+  uptime is invisible.
 - Use **observable gauges with callbacks** so a fresh sample is produced on
   every export, and the series keeps moving while the device is alive.
 - Push interval defaults to 5 s (`--interval` / `PUSH_INTERVAL`).
@@ -71,7 +74,15 @@ Flag beats env var beats default. A leading `http://` on the endpoint is tolerat
 
 - **Last seen** (epoch seconds): `tlast_over_time(device_uptime_seconds[1d])`
 - **Age** (seconds): `time() - tlast_over_time(device_uptime_seconds[1d])`
-- **OFFLINE** when age > `30` s (six missed 5 s pushes). Otherwise ONLINE.
+- **Limit** (seconds of silence allowed): `max(30, 3 x device_report_interval_seconds)`.
+  A device that declares no interval is held to 30 s, which is what a default 5 s
+  agent gets anyway (six missed pushes). One rule, used by the dashboard, the alert
+  and `./fleet`:
+  ```
+  (clamp_min(3 * max by (device_id) (last_over_time(device_report_interval_seconds[1d])), 30) or (0 * max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) + 30))
+  ```
+- **OFFLINE** when age > limit. Otherwise ONLINE. The declared interval is read from
+  the last day of data, so a device that stops reporting keeps the limit it last declared.
 - `tlast_over_time` is MetricsQL (VictoriaMetrics). The Grafana datasource is
   of type `prometheus` pointing at VM, which accepts it. Do not use plain
   `timestamp()`. It returned nothing in testing.
@@ -81,6 +92,91 @@ Flag beats env var beats default. A leading `http://` on the endpoint is tolerat
 - Devices that have never reported are invisible. There is no device registry.
 - A device silent for more than 1 day drops off the dashboard (query window).
 
+## MQTT reporter (optional; `docs/MQTT.md` is the user guide)
+
+Boards that cannot run the agent publish MQTT messages; `bridge/mqtt_bridge.py` (compose services `mosquitto` and
+`mqtt-bridge`, profiles `mqtt` and `mqtt-bridge`, settings in `.env`) turns them into the same metrics. The data path
+for these devices is `board -> broker -> mqtt-bridge -> VictoriaMetrics /api/v1/import/prometheus`; the OTel Collector
+is not involved.
+
+| MQTT topic | Stored as |
+|---|---|
+| `fleet/<device_id>/<metric>`, payload a plain number | `device_<metric>{device_id="<device_id>",job="mqtt-bridge"}` |
+| `fleet/<device_id>/report_interval_seconds` | held by the bridge and written as `device_report_interval_seconds` next to every `uptime_seconds` sample |
+
+- **Names.** `device_id` follows the rule above. `<metric>` matches `^[a-z][a-z0-9_]{0,62}$`. Anything else is dropped.
+- **Labels.** Only `device_id` and `job="mqtt-bridge"`. There is no `hostname` (the table column shows `-`) and no
+  `instance`. `fleet remove` deletes by `device_id`, so it covers these series too.
+- **Liveness is still `device_uptime_seconds`**, so a board that never publishes `uptime_seconds` is invisible (the
+  bridge warns about it after 30 s). The value itself is not interpreted.
+- **Timestamps are the bridge's arrival time**, not the board's. If VictoriaMetrics is unreachable the bridge keeps up
+  to 20,000 lines and delivers them with their original arrival times.
+- **Retained messages are never readings** (the broker replays them on every reconnect, so they would make a dead
+  device look alive). The one exception is `report_interval_seconds`, which is configuration: valid range above 0 and up to 28800 (8 h: the limit, 3 x, must stay inside the one-day lookback).
+- **Limits.** 500 devices, 64 metrics per device.
+- **Broker (bundled).** User `fleet`, password generated into `.env` (mode 600, gitignored), access list `fleet/#`
+  only, plain MQTT on 1883. Last Will / status topics are not used.
+
+## Watcher (optional; `docs/WATCH.md` is the user guide)
+
+Things that cannot run the agent (a router, a NAS, a service, a board that serves Prometheus text) are checked by
+`watcher/watcher.py` (compose service `watcher`, profile `watch`, target list in `watch/targets.json` managed by
+`./fleet watch`). Kinds: `ping HOST`, `tcp HOST:PORT`, `http URL`, `metrics URL`. Data path:
+`watcher -> VictoriaMetrics /api/v1/import/prometheus`; the OTel Collector is not involved.
+
+Written on **every** check, stamped with the time the check finished, labels `device_id`, `job="watcher"`, `kind`:
+
+| Series | Value |
+|---|---|
+| `device_probe_success` | 1 if the check succeeded, else 0 |
+| `device_probe_duration_seconds` | how long the check took (for ping: the reply time) |
+| `device_report_interval_seconds` | the target's check interval (so the limit above applies: `max(30 s, 3 x interval)`) |
+| `device_http_status_code` | the HTTP status, for `http` and `metrics` targets that got an answer |
+
+Written **only when the check succeeded**:
+
+| Series | Value |
+|---|---|
+| `device_uptime_seconds` | **observed uptime**: seconds the target has answered *continuously*. Zero on the first answer after a gap. This is not time since boot; it is the liveness signal, so a target that stops answering goes quiet and becomes OFFLINE like any other device. |
+| the scraped series (`metrics` only) | the target's own numbers under their own names, with the labels `device_id`, `job`, `kind` added. A scraped label of those names is kept as `exported_<name>`. |
+| `device_scrape_series` | how many scraped series were kept |
+
+- A target that has never answered is invisible (the same rule as for every device). `./fleet watch list` shows it as
+  `waiting`, and `./fleet watch add` reports why from the watcher's log.
+- **Reserved:** scraped names starting with `device_` are dropped, so a scraped page cannot overwrite the series above.
+  NaN and infinite values are dropped. At most `max_series` (default 2000, up to 10000, the first ones the page lists) and 5 MB are taken from one answer. A page that is not
+  Prometheus text (a web page) is a failed check, not a healthy target with no data.
+- `http` succeeds on 2xx and 3xx (after redirects), or on exactly `expect_status` when one is set. `metrics` needs 200
+  and at least one usable series. Certificates are verified unless the target says `insecure`.
+- Limits: 100 targets, interval 5 to 3600 s, timeout up to the interval. No login, token or header can be sent.
+- There is no `hostname` label (the table column shows `-`).
+
+## Check-in URL (optional; `docs/CHECKIN.md` is the user guide)
+
+Anything that can run `curl` reports in through `watcher/checkin.py` (compose service `checkin`, profile `checkin`,
+published on port 8081, key in `.env` as `CHECKIN_KEY`). Data path: `curl -> checkin -> VictoriaMetrics
+/api/v1/import/prometheus`; the OTel Collector is not involved.
+
+`GET` or `POST /checkin/<device_id>?key=KEY[&every=SECONDS][&<name>=<number>...]`
+
+| Part | Rule |
+|---|---|
+| `key` | must equal `CHECKIN_KEY`, else 401. Never written to a log. |
+| `<device_id>` | the device id rule above, else 400 |
+| `every` | optional, 5 to 28800 s (8 h, so the 3 x limit stays inside the one-day lookback). It is remembered per device by the service, so a later check-in without it keeps the last value. |
+| `<name>=<number>` | a reading: `^[a-z][a-z0-9_]{0,62}$`, a plain finite number, stored as `device_<name>`; at most 64 per request; `report_interval_seconds` is refused (use `every`); `uptime_seconds` overrides the uptime below |
+| answer | 200 `ok`; 400 with the reason; 401; 404; 414 (address over 2000 characters); 503 (more than 500 devices) |
+
+Written per check-in, stamped on arrival, labels `device_id` and `job="checkin"` (no `hostname`, no `instance`):
+
+| Series | Value |
+|---|---|
+| `device_uptime_seconds` | **observed**: seconds the device has checked in continuously. It starts over when the gap since the last check-in exceeds the limit (`max(30 s, 3 x every)`; 30 s while no `every` is known). Or the value the device sent as `uptime_seconds`. |
+| `device_report_interval_seconds` | the declared `every`, when known |
+| `device_<name>` | each reading |
+
+A device that has never checked in is invisible (the same rule as for every device).
+
 ## Grafana (provisioned from files, nothing configured by hand)
 
 | Item | Value |
@@ -89,7 +185,7 @@ Flag beats env var beats default. A leading `http://` on the endpoint is tolerat
 | Dashboard | uid `device-fleet`, title `Device Fleet`, file `grafana/dashboards/device-fleet.json` (the compose home-dashboard env var points at this filename) |
 | Dashboard columns | device_id, hostname, state (ONLINE/OFFLINE, colour coded), last seen, CPU %, memory %, disk %, temperature, uptime |
 | Alert rule | uid `device-offline`, title `DeviceOffline`, folder `Device Fleet`, group `device-health` |
-| Alert behaviour | one alert instance per `device_id`; condition age > 30 s; pending `for: 30s`; evaluated every `10s`; labels `severity=critical` (`device_id` comes from the query labels); `noDataState: OK` (a device with no series is not alerting); `execErrState: Error` (if VictoriaMetrics is unreachable Grafana raises a separate DatasourceError alert rather than marking every device DeviceOffline) |
+| Alert behaviour | one alert instance per `device_id`; condition age > limit (above); pending `for: 30s`; evaluated every `10s`; labels `severity=critical` (`device_id` comes from the query labels); `noDataState: OK` (a device with no series is not alerting); `execErrState: Error` (if VictoriaMetrics is unreachable Grafana raises a separate DatasourceError alert rather than marking every device DeviceOffline) |
 | Notifications | No contact point is configured. State is visible in Grafana Alerting and through its API. This is a documented limitation. |
 
 Mounts (already in `docker-compose.yml`):

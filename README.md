@@ -4,121 +4,188 @@
 > and it is **not suitable for clinical or medical-device use**. It has no authentication
 > and no encryption (see [Known limitations](#known-limitations)).
 
-## Quickstart
+## Quickstart: from nothing to a dashboard with your devices on it
 
-### What this is
+One command, `./fleet`, runs everything. The whole workflow is: **put the server on a laptop or a Raspberry Pi**
+(steps 1 to 3), **add each device the way that suits it** (step 4), then look at the dashboard and set up alerts
+(steps 5 and 6).
 
-A small open-source stack for **independent IoT developers, researchers and small teams** who run
-a handful of Raspberry Pi or Linux devices. Each device runs a tiny Python agent that pushes its
-health (CPU, memory, disk, uptime and, where available, temperature) to a central server. You
-watch **every device's health and connectivity on one Grafana dashboard** and get an alert when a
-device stops reporting. The server side is plain Docker Compose: OpenTelemetry Collector,
-VictoriaMetrics and Grafana.
+```
+  your devices                                    the server (a laptop or a Raspberry Pi)
+  ------------                                    ---------------------------------------
+  Raspberry Pi, Linux machine --- agent --------->  one Grafana dashboard: every device, ONLINE / OFFLINE
+  ESP32, Pico W, other boards --- MQTT ---------->  an alert when a device goes quiet
+  cron job, script, router ------ check-in URL -->  (optionally a message to your phone)
+  router, NAS, service ---------- watched from the server, nothing installed on them
+```
 
-### Prerequisites
+### 1. Pick the machine for the server
 
-- Docker with Compose v2 (`docker compose version` must work) and permission to run it
-- Python 3.9 or newer with `venv` (runs both `./fleet` and the device agent; on Debian / Raspberry Pi OS: `sudo apt install python3-venv`)
-- Free ports on the machine that runs the stack:
+The server collects, stores and shows everything. **It must stay switched on:** while it is off or asleep nothing
+is recorded and no alert can fire (devices keep trying and carry on when it is back).
 
-| Port | Used by |
+| Server machine | Status |
 |---|---|
-| 3000 | Grafana (dashboard, login `admin` / `admin`) |
-| 4317 | OpenTelemetry Collector, OTLP gRPC (what the agents send to) |
-| 4318 | OpenTelemetry Collector, OTLP HTTP (published, not used by the agent) |
-| 8428 | VictoriaMetrics (storage and query API) |
+| A Linux laptop or desktop (x86_64) | **Tested** on Ubuntu 24.04 |
+| A Raspberry Pi 5, 64-bit Raspberry Pi OS or Debian | **Tested** (Debian 13, arm64) |
+| A Raspberry Pi 4, 64-bit OS | Not tested |
+| A Pi Zero 2 W, or any 32-bit OS | Not for the server (too little memory). As a *device* it should work (not tested). |
+| macOS or Windows (Docker Desktop) | Not tested |
 
-### Commands at a glance
+It needs about **590 MB of downloads and 2.6 GB of disk** (measured on arm64), and about 335 MiB of RAM while running
+(measured on x86: Grafana 258, VictoriaMetrics 41, collector 35). Use a connection without a data cap for the first start (not a phone hotspot).
 
-One helper, `./fleet`, runs everything below. Use it on the machine that hosts the stack:
+### 2. Install what the server needs
 
-| Command | What it does |
-|---|---|
-| `./fleet up` | Start everything, wait until it is ready, print the dashboard address |
-| `./fleet down` | Stop everything. **Asks first** and confirms afterwards. `--wipe` also deletes stored data |
-| `./fleet status` | Is the stack healthy, and how many devices are online |
-| `./fleet list` | Every device: state, last seen, CPU, memory, disk, temperature, uptime (`--json` for scripts) |
-| `./fleet check <id>` | One device in detail |
-| `./fleet add <id>` | Onboard a device: prints what to run on it and waits until it appears |
-| `./fleet remove <id>` | Forget a retired device (deletes its stored data, asks first) |
-| `./fleet notify set\|test\|status\|off` | Send alerts to Discord, Slack, Telegram or a webhook |
+Docker with Compose v2, Python 3.9 or newer, and git. On Debian, Ubuntu or Raspberry Pi OS:
 
-It is a thin wrapper around `docker compose` and the stack's own APIs, so the plain commands still
-work; they are listed [at the end of this section](#without-the-helper).
+```bash
+curl -fsSL https://get.docker.com | sudo sh        # Docker's own installer (docs.docker.com/engine/install has the manual way)
+sudo usermod -aG docker $USER                      # then log out and back in, so you can run docker without sudo
+sudo apt install -y git python3 python3-venv
+docker compose version                             # must print a version
+```
 
-### 1. Start the stack
+The server uses these ports. Nothing else on the machine may use them, and if it has a firewall (`ufw`, say), devices
+on other machines must be able to reach the ones they use:
+
+| Port | Used by | Who connects |
+|---|---|---|
+| 3000 | Grafana, the dashboard | you, in a browser |
+| 4317 | OpenTelemetry Collector (what the Linux agent sends to) | Raspberry Pis and Linux machines |
+| 8428 | VictoriaMetrics (storage and query API) | the server itself |
+| 1883 | MQTT broker, only after `./fleet up --mqtt` | boards that speak MQTT |
+| 8081 | Check-in URL, only after `./fleet add <id> --checkin` | anything running `curl` |
+
+### 3. Start the server
 
 ```bash
 git clone https://github.com/malhar-sk/icu-observability-stack.git
 cd icu-observability-stack
-
 ./fleet up
 ```
 
-`./fleet up` starts the three services, waits until each answers, then prints the dashboard address,
-the login, and the address devices report to. The **first run downloads about 590 MB** of Docker
-images (mostly Grafana), so avoid a metered connection such as a phone hotspot.
+It starts everything, waits until each part answers, and prints the dashboard address and where devices report to.
+Open the dashboard address (<http://localhost:3000> on the server itself) and log in with `admin` / `admin`
+(Grafana may ask for a new password; you can skip that). The **Device Fleet** dashboard is the home page, empty for now.
 
-### 2. Run two devices (two terminals)
+**Give the server a stable address.** Devices find it by its IP address (`./fleet up` and `./fleet add` print it). If the
+address changes (ordinary DHCP, or a phone hotspot, which picks a new subnet from time to time) devices silently stop
+reporting. Reserve the server's address in your router. Do not set a fixed IP on a phone-hotspot Wi-Fi profile.
 
-Both "devices" are this machine here; what tells them apart is the `--device-id`. In the repository
-folder, once:
+### 4. Add your devices
+
+Pick the row that matches the device. Each has its own short walkthrough below.
+
+| The device is... | How it reports | Needs on the device |
+|---|---|---|
+| A Raspberry Pi or other Linux machine you can log in to | [**4a. The agent**](#4a-a-raspberry-pi-or-linux-machine-the-agent) | Python 3.9+, internet once |
+| An ESP32, Pico W, Arduino or other board with Wi-Fi or Ethernet | [**4b. MQTT**](#4b-a-board-that-speaks-mqtt-esp32-pico-w-arduino) | MQTT code in its firmware |
+| A cron job, a script, a router, anything that can run `curl` | [**4c. Check-in URL**](#4c-anything-that-can-run-curl-the-check-in-url) | `curl` |
+| A router, NAS, web service or ESPHome board you would rather not touch | [**4d. Watch it**](#4d-something-you-cannot-install-anything-on-watch-it) | nothing |
+
+You can mix all four. Every device needs its own **device ID**: lowercase letters, digits, `.`, `_` and `-` (for
+example `kitchen-pi`). Two devices with the same ID overwrite each other.
+
+#### 4a. A Raspberry Pi or Linux machine: the agent
+
+The agent is a small Python program that reports CPU, memory, disk, uptime and (where the machine has a sensor)
+temperature every 5 seconds. A Pi Zero 2 W follows the same steps (not tested on one).
+
+1. **On the server**, run `./fleet add kitchen-pi`. It checks the ID is free, prints the exact commands below with the
+   server's address filled in, and then waits for the device to appear.
+2. **Copy the agent to the device** (run this on the server; replace `pi@PI-ADDRESS` with the device's login):
+   ```bash
+   scp agent/device_agent.py agent/requirements.txt agent/install-service.sh pi@PI-ADDRESS:
+   ```
+3. **On the device**, try it first (it stops when you close the terminal):
+   ```bash
+   sudo apt install -y python3-venv                 # Raspberry Pi OS / Debian, if it is missing
+   python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+   python device_agent.py --device-id kitchen-pi --endpoint SERVER-ADDRESS:4317
+   ```
+4. **Keep it running for good** (starts at boot, restarts if it crashes). On the device:
+   ```bash
+   sudo bash install-service.sh --device-id kitchen-pi --endpoint SERVER-ADDRESS:4317
+   ```
+   Undo it with `sudo bash install-service.sh --uninstall`. It needs systemd and internet access once.
+
+Within about 15 seconds `./fleet add` prints that the device is online. More detail, and the manual steps:
+[Monitoring a real remote Raspberry Pi](#monitoring-a-real-remote-raspberry-pi).
+
+#### 4b. A board that speaks MQTT (ESP32, Pico W, Arduino)
+
+MQTT is the usual language of hobby boards. The server runs the broker for you.
+
+1. **On the server**, turn it on once: `./fleet up --mqtt` (or `./fleet up --mqtt-broker 192.168.1.20 --mqtt-user NAME`
+   if you already run a broker). It remembers the choice.
+2. **Add the board:** `./fleet add garage-esp32 --mqtt`. It prints the broker's address, user name and password, the
+   topics to publish to, and test commands, then waits for the board.
+3. **In the board's code**, connect to that broker and publish plain numbers every time it reports:
+   - `fleet/garage-esp32/uptime_seconds`: any number that keeps growing (**required**, it is the "alive" signal)
+   - `fleet/garage-esp32/report_interval_seconds`: how often it reports, so a board that sleeps for a minute is not
+     flagged after 30 s
+   - `fleet/garage-esp32/temperature_celsius`, or any other reading name
+
+Examples for shell, Python, MicroPython and Arduino, and what the bridge refuses: **[docs/MQTT.md](docs/MQTT.md)**.
+
+#### 4c. Anything that can run `curl`: the check-in URL
+
+For a cron job, a backup script, a router, a board that only speaks HTTP, or a machine behind a firewall. The device calls a
+URL each time it is alive; if it stops calling, it goes OFFLINE.
+
+1. **On the server:** `./fleet add backup-job --checkin` (add `--every 300` if it will check in every 5 minutes; the
+   default is 60 seconds). The first time, it starts the check-in service and creates a key.
+2. **It prints a command like this.** Run it on the device whenever it should report in:
+   ```bash
+   curl -fsS -m 10 "http://SERVER-ADDRESS:8081/checkin/backup-job?key=THE-KEY&every=60"
+   ```
+3. **For something periodic, put it in cron** (`crontab -e`; `./fleet add` prints the line for your interval):
+   ```
+   * * * * * curl -fsS -m 10 "http://SERVER-ADDRESS:8081/checkin/backup-job?key=THE-KEY&every=60" >/dev/null
+   ```
+   For a "the job finished" signal, put the `curl` at the **end** of your script: a failed run never reaches it, so the
+   device goes OFFLINE and the alert fires.
+4. **Add readings** with extra `&name=number` pairs, for example `&temperature_celsius=21.5&battery_volts=3.9`.
+
+The device is OFFLINE after 3 times its `every` (at least 30 s). Details, errors and limits: **[docs/CHECKIN.md](docs/CHECKIN.md)**.
+
+#### 4d. Something you cannot install anything on: watch it
+
+A router, a NAS, a web service, a PLC's port, an ESP32 running ESPHome. The server checks it for you; nothing goes on
+the device.
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate && pip install -r agent/requirements.txt
+./fleet watch add router   ping    192.168.1.1                        # answers a ping
+./fleet watch add nas      tcp     192.168.1.20:445                   # accepts a connection on that port
+./fleet watch add pihole   http    http://192.168.1.2/admin/          # a web page answers
+./fleet watch add printer  metrics http://192.168.1.50:7125/metrics   # serves Prometheus text; its numbers are stored too
+./fleet watch list                                                    # what is watched, and how it is doing
 ```
 
-Then in two terminals (each needs `. .venv/bin/activate` first):
+It waits for the first answer and tells you if there is none, and why. Use IP addresses, not `.local` names (containers
+usually cannot resolve those). Options and troubleshooting: **[docs/WATCH.md](docs/WATCH.md)**.
+
+### 5. See it working
+
+Open the dashboard (<http://SERVER-ADDRESS:3000>, or `localhost` on the server). Every device is one row: device ID,
+state (ONLINE / OFFLINE), last seen, and CPU, memory, disk, temperature and uptime where the device has them. The graphs
+below fill in over the next half minute. On the command line:
 
 ```bash
-# terminal 1
-python agent/device_agent.py --device-id demo-pi-1
-
-# terminal 2
-python agent/device_agent.py --device-id demo-pi-2
+./fleet list              # every device: state, last seen, readings (--json for scripts)
+./fleet check kitchen-pi  # one device in detail, including how it reports
+./fleet status            # is the server healthy, and how many devices are online
 ```
 
-Each agent logs a few startup lines and then runs quietly, pushing every 5 seconds.
+**What OFFLINE means.** A device is OFFLINE when it has been quiet for longer than 3 times its reporting interval, and
+never less than 30 seconds (the default agent reports every 5 s, so 30 s). The `DeviceOffline` alert fires about 30
+seconds after that: roughly 70 seconds after a default agent stops. Try it: stop a device and watch its row turn red,
+then open **Alerting, Alert rules, Device Fleet, DeviceOffline** in Grafana.
 
-**For a real, separate device use `./fleet add kitchen-pi` instead.** It checks the ID is free, prints
-the exact copy-and-run commands with this machine's address filled in, and waits until the device
-shows up. See [Monitoring a real remote Raspberry Pi](#monitoring-a-real-remote-raspberry-pi).
+### 6. Get alerts on your phone (optional)
 
-### 3. Open the dashboard
-
-Go to <http://localhost:3000> and log in with `admin` / `admin` (Grafana may ask you to change the
-password; you can skip that). The **Device Fleet** dashboard opens as the home page. Within about
-15 to 20 seconds of starting the agents you should see one row per device: device ID, hostname,
-state (ONLINE / OFFLINE), last seen, CPU %, memory %, disk % and uptime. A **temperature** column
-appears as soon as any device reports one (a Raspberry Pi does, via `/sys/class/thermal`); devices
-without a sensor then show "N/A" in it. If no device has a sensor, as on many VMs, the column is
-simply not shown. The graphs below the table need a little longer than the table to fill in (they
-showed "No data" 17 s after start and had lines about 30 s in).
-
-### 4. Check on your devices
-
-```bash
-./fleet list              # state, last seen and readings for every device
-./fleet check demo-pi-2   # one device in detail
-```
-
-### 5. Simulate a device going offline
-
-Press **Ctrl+C** in the `demo-pi-2` terminal.
-
-- **Within roughly 30 to 40 seconds** the `demo-pi-2` row switches to **OFFLINE** (a device is
-  offline when it has not reported for more than 30 s), and `./fleet list` shows the same.
-  `demo-pi-1` stays ONLINE.
-- In Grafana go to **Alerting, then Alert rules**, expand the folder **Device Fleet** and the group
-  `device-health`, and click **DeviceOffline**. The **Instances** tab (and the Threshold table at the
-  bottom of the page) lists one instance per device. `demo-pi-2` goes **Pending** and then **Firing**
-  about 70 seconds after you stopped the agent; `demo-pi-1` stays **Normal**.
-- Start `demo-pi-2` again: it returns to ONLINE and the alert instance goes back to Normal
-  within roughly 20 s (the rule is evaluated every 10 s).
-
-### Alerts that reach you (optional)
-
-Out of the box, an offline device only shows up if you open Grafana. To get a message instead:
+Out of the box an offline device only shows up if you open Grafana. To get a message instead:
 
 ```bash
 ./fleet notify set discord                   # asks for the webhook URL, with the input hidden
@@ -127,10 +194,8 @@ Out of the box, an offline device only shows up if you open Grafana. To get a me
 ./fleet notify set webhook https://your.service/endpoint   # anything that accepts a JSON POST
 ```
 
-`set` hands the address to Grafana (which stores it encrypted; `fleet` never keeps it), sends a test
-message, and then **waits until Grafana has switched over**. That takes up to about a minute, because
-Grafana applies alerting changes on a one-minute cycle; until then alerts still use the old setting.
-After that:
+`set` hands the address to Grafana (which stores it encrypted; `fleet` never keeps it), sends a test message, and waits
+until Grafana has switched over (up to about a minute: it applies alerting changes on a one-minute cycle). After that:
 
 ```bash
 ./fleet notify test      # send another test message
@@ -138,38 +203,38 @@ After that:
 ./fleet notify off       # stop sending (alerts stay visible in Grafana)
 ```
 
-You get one message per device when it goes offline and a recovery message when it is back. In testing
-the offline message arrived about 80 s after the device stopped, and the recovery message about a
-minute after it returned. If you already customised Grafana's notification policy, `set` refuses to
-overwrite it unless you add `--force`.
+You get one message per device when it goes offline and one when it is back. **What was tested:** a real alert delivered to a
+webhook end to end; the Slack and Discord formats against a local listener only; Telegram could not be reached from the
+test machine. Email is not covered. See [docs/VALIDATION.md](docs/VALIDATION.md), Run E.
 
-**What was tested:** a real alert delivered end to end to a webhook, and the message formats for Slack
-and Discord checked against a local listener, not the real services. Telegram's delivery could not be
-tested (the test machine could not reach it); its failure message was. Email is not covered by this
-command. See [docs/VALIDATION.md](docs/VALIDATION.md), Run E.
+### 7. Day to day
 
-### 6. Retire a device
+| I want to... | Run |
+|---|---|
+| See everything | `./fleet list` or the dashboard |
+| Retire a device for good | `./fleet remove kitchen-pi` (asks first, deletes its data; for a watched target use `./fleet watch remove`) |
+| Stop the server, keep the data | `./fleet down` (asks first) |
+| Stop it and delete all data | `./fleet down --wipe` (asks twice) |
+| Start it again | `./fleet up` (it remembers MQTT, watching and check-in) |
+| Update to a newer version | `git pull`, then `./fleet up` |
+| Turn the MQTT input or check-in URL off | `./fleet up --no-mqtt`, `./fleet up --no-checkin` |
 
-A device that is gone for good stays on the dashboard as OFFLINE for a day, and keeps its alert. Stop
-its agent, then:
+A retired device that is not removed stays on the dashboard as OFFLINE for a day, with its alert. Devices keep trying
+while the server is down; after a short outage (about half a minute, the only length tested) they resumed by themselves.
 
-```bash
-./fleet remove demo-pi-2
-```
+### Not ready for real devices? Try it with two pretend ones
 
-It asks first, then deletes that device's stored data. The device is gone from the dashboard table
-and `./fleet list` at once, and its alert cleared in under 20 s in testing. `remove` refuses a device
-that is reporting right now unless you add `--force` (it comes back on its next report).
-
-### 7. Stop the stack
+On the server itself, in the repository folder:
 
 ```bash
-./fleet down            # asks first; stops everything, keeps stored metrics and Grafana state
-./fleet down --wipe     # ALSO DELETES all stored metrics and Grafana state (asks twice)
+python3 -m venv .venv && . .venv/bin/activate && pip install -r agent/requirements.txt
+python agent/device_agent.py --device-id demo-pi-1        # terminal 1
+python agent/device_agent.py --device-id demo-pi-2        # terminal 2 (each needs `. .venv/bin/activate` first)
 ```
 
-Devices keep running and retry while the stack is down. After a short outage (about half a minute,
-the only length tested) they resumed by themselves once `./fleet up` was back.
+Both rows appear within 15 to 20 seconds. Press **Ctrl+C** in the second terminal: `demo-pi-2` turns OFFLINE within
+about 30 to 40 seconds and its alert fires about 70 seconds after you stopped it; start it again and it recovers
+within about 20 s.
 
 ### Without the helper
 
@@ -177,24 +242,21 @@ the only length tested) they resumed by themselves once `./fleet up` was back.
 
 ```bash
 docker compose up -d       # = ./fleet up, without waiting for readiness
-docker compose down        # = ./fleet down, without asking
+docker compose down        # = ./fleet down, without asking (use `docker compose --profile '*' down` if MQTT, watching or check-in is on)
 docker compose down -v     # = ./fleet down --wipe, without asking: ALSO DELETES stored data
 ```
 
 ### Check everything automatically
 
-`scripts/validate.sh` runs the whole scenario above without a browser: it starts the stack, runs two
-agents, checks both devices appear, stops one, and waits for it to be OFFLINE and for the
-`DeviceOffline` alert to fire for that device only. It takes about three minutes, exits non-zero on any
-failure, and leaves the stack running unless you pass `--down`.
+Each of these runs a whole scenario without a browser, exits non-zero on any failure, and uses test device IDs it
+cleans up afterwards. Record results in [docs/VALIDATION.md](docs/VALIDATION.md).
 
-```bash
-scripts/validate.sh          # uses .venv/bin/python automatically if it exists
-scripts/validate.sh --help   # environment overrides (VM_URL, GRAFANA_URL, GRAFANA_AUTH, PYTHON, ...)
-```
-
-It uses the device IDs `demo-pi-1` and `demo-pi-2`, so stop your own agents with those IDs first.
-Record results in [docs/VALIDATION.md](docs/VALIDATION.md).
+| Script | Covers | Takes |
+|---|---|---|
+| `scripts/validate.sh` | the agent: two devices, one stopped, the alert (IDs `demo-pi-1`, `demo-pi-2`; `--help` for options) | about 3 min |
+| `scripts/validate_mqtt.sh` | the MQTT input: access control, labels, a slow board, offline detection, the alert | about 4 min |
+| `scripts/validate_watch.sh` | `./fleet watch`: ping, port, pages, a real exporter, a hostile page, stop and start, the alert | about 6 min |
+| `scripts/validate_checkin.sh` | the check-in URL with the real container and `curl`: the key, bad input, a slow device, offline and back | about 3 min |
 
 ---
 
@@ -345,9 +407,15 @@ Each agent samples `/proc` and `/sys` and pushes five gauges, tagged with its `d
 Collector (`otel-collector.yaml`) forwards them unchanged to VictoriaMetrics. Grafana is provisioned
 from files in `grafana/` (data source, dashboard and alert rule), so nothing is set up by hand.
 A device's **last seen** time is the newest `device_uptime_seconds` sample, its **age** is
-`time() - tlast_over_time(device_uptime_seconds[1d])`, and it is **OFFLINE** when the age is above
-30 s (six missed pushes). The `DeviceOffline` rule uses the same query, evaluated every 10 s, with
-a 30 s pending period, and produces one alert instance per device.
+`time() - tlast_over_time(device_uptime_seconds[1d])`, and it is **OFFLINE** when the age is above its
+limit: 30 s (six missed pushes) for the default agent, or 3 times the interval the device declares in
+`device_report_interval_seconds` when that is longer, so a device that reports slowly on purpose is not
+flagged. The `DeviceOffline` rule uses the same query, evaluated every 10 s, with a 30 s pending
+period, and produces one alert instance per device. Boards that speak MQTT join the same pipeline
+through a small bridge (`bridge/mqtt_bridge.py`) that writes their readings to VictoriaMetrics; things
+that cannot run anything are checked by a watcher (`watcher/watcher.py`) that writes the same series from
+the server's side; and anything that can run `curl` reports through a small check-in service
+(`watcher/checkin.py`). Whichever way a device reports, the offline rule above is the only one.
 
 Vector (`vector.toml`) is not part of the default stack. It is parked behind the compose profile
 `legacy-vector` because its demo configuration is broken; do not start it expecting it to work.
@@ -358,10 +426,13 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 - **No device registry.** A device that has never reported is invisible, and a device silent for more than a day drops off the dashboard. That is why `./fleet add` cannot "create" a device on the server: a device exists once it reports.
 - **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there; on a device, `agent/install-service.sh` makes the agent start at boot (systemd only). Both `./fleet` and the installer were tested on x86_64 Linux; neither has been run on the Raspberry Pi.
 - **Notifications are opt-in.** Until you run `./fleet notify set ...`, an alert is visible only inside Grafana (and its API). `fleet notify` covers Discord, Slack, Telegram and webhooks, not email, and only the webhook path was tested end to end.
-- **Offline detection is not instant.** It needs a push every 5 s and takes about a minute from the device stopping to the alert firing.
+- **Offline detection is not instant.** With the default agent it takes about a minute from the device stopping to the alert firing; a device that reports every N seconds is OFFLINE after 3N (at least 30 s), and the alert follows 30 s later.
+- **Watching is from the server's side only.** The watcher sees what its container sees, cannot send a login or token, and for a watched target "uptime" means time answering continuously, not time since boot. A target that has never answered is invisible, like any device. Tested against real containers and a real exporter (VictoriaMetrics' own `/metrics`) and ESPHome-style sample output; **no real ESPHome board, router or PLC was available**. See [docs/WATCH.md](docs/WATCH.md).
+- **The check-in URL is plain HTTP with one shared key.** Anyone on your network who has the key can report as any device. A device can check in at most every 5 s and at slowest every 8 h (the dashboard looks back one day). Tested with `curl` against the container from the same machine; routers, `wget` and boards calling the URL themselves were not tried. See [docs/CHECKIN.md](docs/CHECKIN.md).
+- **MQTT is plain and shared.** No TLS, one shared password for all boards, our `fleet/<device_id>/<metric>` topic scheme only (Tasmota, ESPHome, Zigbee2MQTT and Home Assistant topics are not mapped), and no Last Will handling: a board is OFFLINE by silence. Tested with simulated devices and a real broker; **no real ESP32, Pico or Arduino was available**. See [docs/MQTT.md](docs/MQTT.md).
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
 - **Single node, demo scale.** One VictoriaMetrics, one Collector, one Grafana, no redundancy or retention tuning.
-- **Verified on x86_64 Linux and on one Raspberry Pi 5** (aarch64, Debian 13 "trixie"), where the stack and both demo agents ran on the same Pi and the dashboard was viewed from a laptop. **Not yet verified:** a separate device pushing to the server over the network, 32-bit Raspberry Pi OS, Pi Zero-class hardware, and ESP32-class devices (the agent is Linux-only). See [docs/VALIDATION.md](docs/VALIDATION.md).
+- **Verified on x86_64 Linux and on one Raspberry Pi 5** (aarch64, Debian 13 "trixie"), where the stack and both demo agents ran on the same Pi and the dashboard was viewed from a laptop. **Not yet verified:** a separate device pushing to the server over the network, 32-bit Raspberry Pi OS, Pi Zero-class hardware, and real ESP32-class boards (the agent is Linux-only; they use the MQTT input, tested only with simulated devices). See [docs/VALIDATION.md](docs/VALIDATION.md).
 - **Demonstration only.** Not production-ready and not suitable for clinical or medical-device use.
 
 ---

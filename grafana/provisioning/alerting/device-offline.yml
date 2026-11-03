@@ -1,6 +1,7 @@
 # One Grafana-managed alert rule, one alert instance per device_id.
 # Semantics are fixed by docs/CONTRACT.md: age = time() - tlast_over_time(device_uptime_seconds[1d]),
-# OFFLINE when age > 30 s, 'for: 30s', evaluated every 10 s.
+# OFFLINE when age > max(30 s, 3 x the device's own device_report_interval_seconds), 'for: 30s',
+# evaluated every 10 s. A device that declares no interval is held to 30 s.
 #
 # Deliberately NOT provisioned: contact point and notification policy (none is configured;
 # alert state is visible in Grafana Alerting and through its API).
@@ -23,7 +24,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: 'Device {{ $labels.device_id }} has not reported for {{ printf "%.0f" $values.B.Value }} s (threshold 30 s)'
+          summary: 'Device {{ $labels.device_id }} has not reported for {{ printf "%.0f" $values.B.Value }} s (it is offline after {{ printf "%.0f" $values.M.Value }} s of silence)'
         data:
           # A: seconds since the last device_uptime_seconds sample, one series per device_id
           - refId: A
@@ -41,6 +42,23 @@ groups:
               range: false
               intervalMs: 1000
               maxDataPoints: 43200
+          # L: seconds of silence after which each device counts as OFFLINE: 3 x the interval it declares
+          # (never below 30 s); 30 s for a device that declares none
+          - refId: L
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: victoriametrics
+            model:
+              refId: L
+              datasource:
+                type: prometheus
+                uid: victoriametrics
+              expr: (clamp_min(3 * max by (device_id) (last_over_time(device_report_interval_seconds[1d])), 30) or (0 * max by (device_id) (time() - tlast_over_time(device_uptime_seconds[1d])) + 30))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
           # B: reduce each series to a number
           - refId: B
             datasourceUid: __expr__
@@ -54,18 +72,26 @@ groups:
               datasource:
                 type: __expr__
                 uid: __expr__
-          # C: threshold, age > 30 s fires
+          # M: the same for the limit
+          - refId: M
+            datasourceUid: __expr__
+            model:
+              refId: M
+              type: reduce
+              expression: L
+              reducer: last
+              settings:
+                mode: dropNN
+              datasource:
+                type: __expr__
+                uid: __expr__
+          # C: fires (1) when a device has been silent for longer than its own limit
           - refId: C
             datasourceUid: __expr__
             model:
               refId: C
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator:
-                    type: gt
-                    params:
-                      - 30
+              type: math
+              expression: $B > $M
               datasource:
                 type: __expr__
                 uid: __expr__

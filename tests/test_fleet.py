@@ -10,6 +10,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.parse
@@ -21,6 +22,8 @@ _loader = importlib.machinery.SourceFileLoader("fleet", os.path.join(ROOT, "flee
 _spec = importlib.util.spec_from_loader("fleet", _loader)
 fleet = importlib.util.module_from_spec(_spec)
 _loader.exec_module(fleet)
+_TMP = tempfile.mkdtemp(prefix="fleet-test-")
+fleet.ENV_FILE = os.path.join(_TMP, ".env")  # never read (or write) a real .env
 
 
 def run(argv):
@@ -65,8 +68,11 @@ class FakeVM(BaseHTTPRequestHandler):
                 devices = {}
             result = [{"metric": {"device_id": d}, "value": [0, str(v["age"])]} for d, v in devices.items()]
         elif "topk by" in expr:
-            result = [{"metric": {"device_id": d, "hostname": v["host"]}, "value": [0, str(v["last"])]}
+            result = [{"metric": {"device_id": d, "hostname": v["host"], "job": v["job"]}, "value": [0, str(v["last"])]}
                       for d, v in devices.items()]
+        elif "device_report_interval_seconds" in expr:
+            result = [{"metric": {"device_id": d}, "value": [0, str(v["interval"])]}
+                      for d, v in devices.items() if v.get("interval") is not None]
         else:
             for key, metric in fleet.READINGS:
                 if f"last_over_time({metric}[1m])" in expr:
@@ -90,8 +96,10 @@ class FakeVM(BaseHTTPRequestHandler):
         self._send(404)
 
 
-def dev(age=5.0, host="pi", cpu=1.5, mem=16.0, disk=22.0, temp=47.5, uptime=3600.0, last=1793513000.0):
-    return {"age": age, "host": host, "cpu": cpu, "mem": mem, "disk": disk, "temp": temp, "uptime": uptime, "last": last}
+def dev(age=5.0, host="pi", cpu=1.5, mem=16.0, disk=22.0, temp=47.5, uptime=3600.0, last=1793513000.0, interval=None,
+        job="device-agent"):
+    return {"age": age, "host": host, "cpu": cpu, "mem": mem, "disk": disk, "temp": temp, "uptime": uptime,
+            "last": last, "interval": interval, "job": job}
 
 
 class WithFakeVM(unittest.TestCase):
@@ -193,6 +201,29 @@ class FetchAndListTests(WithFakeVM):
         self.devices(**{"on": dev(age=30.0), "off": dev(age=30.1)})
         got = fleet.fetch_devices()
         self.assertEqual((got["on"]["state"], got["off"]["state"]), ("ONLINE", "OFFLINE"))
+
+    def test_a_declared_report_interval_widens_the_offline_limit(self):
+        # 3 x the declared interval, never below 30 s. 100 s of silence is fine for a device that reports every minute.
+        self.devices(**{"slow-ok": dev(age=100, interval=60), "slow-late": dev(age=181, interval=60),
+                        "fast-late": dev(age=30.1, interval=5), "undeclared": dev(age=100)})
+        got = fleet.fetch_devices()
+        self.assertEqual({k: v["state"] for k, v in got.items()},
+                         {"slow-ok": "ONLINE", "slow-late": "OFFLINE", "fast-late": "OFFLINE", "undeclared": "OFFLINE"})
+        self.assertEqual((got["slow-ok"]["report_interval"], got["slow-ok"]["offline_after"]), (60.0, 180.0))
+        self.assertEqual((got["undeclared"]["report_interval"], got["undeclared"]["offline_after"]), (None, 30))
+
+    def test_offline_limit_rule(self):
+        for declared, want in [(None, 30), (float("nan"), 30), (0, 30), (-5, 30), (5, 30), (10, 30),
+                               (11, 33), (60, 180), (300, 900)]:
+            self.assertEqual(fleet.offline_limit(declared), want, declared)
+
+    def test_check_shows_the_declared_interval(self):
+        self.devices(**{"sleepy": dev(age=10, interval=300), "plain": dev(age=10)})
+        _, out, _ = run(["check", "sleepy"])
+        self.assertIn("every 5m 00s", out)
+        self.assertIn("OFFLINE after 15m 00s", out)
+        _, out, _ = run(["check", "plain"])
+        self.assertNotIn("reports", out)
 
     def test_list_json(self):
         self.devices(**{"x": dev()})
@@ -342,7 +373,7 @@ class DownTests(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def down_calls(self):
-        return [c for c in self.calls if c[:3] == ["docker", "compose", "down"]]
+        return [c for c in self.calls if c[:5] == ["docker", "compose", "--profile", "*", "down"]]
 
     def test_nothing_to_stop(self):
         self.ps = [{}]
@@ -361,7 +392,7 @@ class DownTests(unittest.TestCase):
     def test_yes_stops_keeps_data_and_confirms(self):
         code, out, _ = run(["down", "--yes"])
         self.assertEqual(code, 0)
-        self.assertEqual(self.down_calls(), [["docker", "compose", "down"]])
+        self.assertEqual(self.down_calls(), [["docker", "compose", "--profile", "*", "down"]])  # every profile: no orphans
         self.assertIn("Stack stopped", out)
         self.assertIn("3 container(s) removed", out)
         self.assertIn("kept", out)
@@ -375,7 +406,7 @@ class DownTests(unittest.TestCase):
         with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch("builtins.input", side_effect=["y", "wipe"]):
             code, out, _ = run(["down", "--wipe"])
         self.assertEqual(code, 0)
-        self.assertEqual(self.down_calls(), [["docker", "compose", "down", "-v"]])
+        self.assertEqual(self.down_calls(), [["docker", "compose", "--profile", "*", "down", "-v"]])
         self.assertIn("deleted", out)
 
     def test_leftover_containers_are_reported_not_hidden(self):

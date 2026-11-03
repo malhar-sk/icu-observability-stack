@@ -31,6 +31,87 @@ services:
       - "4317:4317"
       - "4318:4318"
 
+  # MQTT input (optional): boards that speak MQTT publish to fleet/<device_id>/<metric> and show up like any
+  # other device. Off by default. Start with `./fleet up --mqtt` (bundled broker) or
+  # `./fleet up --mqtt-broker HOST` (a broker you already run); both write the settings below to .env.
+  mosquitto:
+    profiles: ["mqtt"]
+    image: eclipse-mosquitto:2.1.2-alpine
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME-fleet}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        [ -n "$$MQTT_PASSWORD" ] || { echo "MQTT_PASSWORD is empty: start the broker with ./fleet up --mqtt" >&2; exit 1; }
+        mosquitto_passwd -b -c /mosquitto/passwd "$$MQTT_USERNAME" "$$MQTT_PASSWORD"
+        printf 'user %s\ntopic readwrite fleet/#\n' "$$MQTT_USERNAME" > /mosquitto/acl
+        chown mosquitto:mosquitto /mosquitto/passwd /mosquitto/acl  # the broker drops to this user before reading them
+        exec mosquitto -c /mosquitto/config/mosquitto.conf
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+
+  mqtt-bridge:
+    profiles: ["mqtt", "mqtt-bridge"]
+    build: ./bridge
+    image: icu-mqtt-bridge:local
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: ${MQTT_HOST:-mosquitto}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USERNAME: ${MQTT_USERNAME-fleet}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      VM_URL: http://victoriametrics:8428
+
+  # Watcher (optional): checks things that cannot run the agent (a ping, a port, a web page, a metrics endpoint such
+  # as ESPHome's) and reports them as devices. Off by default. `./fleet watch add ...` turns it on (it adds the profile
+  # to .env) and manages the target list in ./watch/targets.json. Runs the stock Python image: nothing to build.
+  watcher:
+    profiles: ["watch"]
+    image: python:3.13-alpine
+    restart: unless-stopped
+    command: ["python", "-u", "/app/watcher.py"]
+    environment:
+      VM_URL: http://victoriametrics:8428
+      TARGETS_FILE: /watch/targets.json
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./watcher:/app:ro
+      - ./watch:/watch:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW  # for ping
+
+  # Check-in URL (optional): anything that can run curl reports in with
+  #   curl "http://SERVER:8081/checkin/<device_id>?key=KEY&every=60"
+  # Off by default. `./fleet add <id> --checkin` turns it on (it creates the key in .env and adds the profile).
+  checkin:
+    profiles: ["checkin"]
+    image: python:3.13-alpine
+    restart: unless-stopped
+    command: ["python", "-u", "/app/checkin.py"]
+    environment:
+      VM_URL: http://victoriametrics:8428
+      CHECKIN_KEY: ${CHECKIN_KEY:-}
+      PYTHONDONTWRITEBYTECODE: "1"
+    ports:
+      - "${CHECKIN_PORT:-8081}:8081"
+    volumes:
+      - ./watcher:/app:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
   # Not started by default: this demo pipeline is currently broken (the image reads
   # /etc/vector/vector.yaml, and the config wires log events into a metrics sink).
   # Start explicitly with: docker compose --profile legacy-vector up -d
@@ -45,3 +126,4 @@ services:
 volumes:
   vm_data:
   grafana_data:
+  mosquitto_data:

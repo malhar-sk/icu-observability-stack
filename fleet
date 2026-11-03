@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """fleet: start, stop and manage the multi-device monitoring stack with one command.
 
-  ./fleet up                  start everything and wait until it is ready
+  ./fleet up [--mqtt]         start everything and wait until it is ready (--mqtt also starts the MQTT input)
   ./fleet down [--wipe]       stop everything (asks first, confirms afterwards)
   ./fleet status              stack health and a device summary
   ./fleet list [--json]       every device: state, last seen, readings
   ./fleet check <id>          one device in detail
-  ./fleet add <id>            onboard a device: shows what to run on it, waits for it to appear
+  ./fleet add <id> [--mqtt|--checkin]   onboard a device: shows what to run on it, waits for it to appear
   ./fleet remove <id>         forget a retired device (deletes its stored data, asks first)
+  ./fleet watch add|list|remove   watch things that cannot run the agent: a ping, a port, a web page, a metrics endpoint
   ./fleet notify set|test|status|off   send alerts to Discord, Slack, Telegram or a webhook
 
 Run it on the machine that hosts the stack. Needs Docker with Compose v2 and Python 3.9+, nothing else.
@@ -18,8 +19,11 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import importlib.util
 import json
 import os
+import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -37,8 +41,19 @@ VM_URL = os.environ.get("FLEET_VM_URL", "http://localhost:8428").rstrip("/")
 GRAFANA_URL = os.environ.get("FLEET_GRAFANA_URL", "http://localhost:3000").rstrip("/")
 GRAFANA_AUTH = os.environ.get("FLEET_GRAFANA_AUTH", "admin:admin")
 OTLP_PORT = 4317
-OFFLINE_AFTER = 30  # seconds without a sample; the same rule the dashboard and the alert use
-LOOKBACK = "1d"     # a device silent for longer drops out of every view
+MQTT_PORT = 1883
+ENV_FILE = os.path.join(ROOT, ".env")  # holds the MQTT settings; gitignored because the password is a secret
+BRIDGE_IMAGE = "icu-mqtt-bridge:local"  # built from ./bridge, never pulled
+WATCHER_IMAGE = "python:3.13-alpine"    # the watcher runs the script from ./watcher in this stock image
+CHECKIN_PORT = 8081  # default; CHECKIN_PORT in .env changes the port published on this machine
+WATCH_DIR = os.path.join(ROOT, "watch")  # the target list lives here (gitignored); the watcher container reads it
+TARGETS_FILE = os.path.join(WATCH_DIR, "targets.json")
+WATCH_FIRST_LOOK, WATCH_LOOK_EVERY = 8, 5  # seconds before `watch add` first reads the watcher's log, and how often after
+WATCH_SETTLE = 3  # seconds the watcher needs to notice a change to the list before its data is deleted
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+OFFLINE_FLOOR = 30   # seconds: the shortest silence that ever counts as OFFLINE
+OFFLINE_FACTOR = 3   # OFFLINE after this many of the device's own report intervals in a row with no report
+LOOKBACK = "1d"      # a device silent for longer drops out of every view
 POLL_SECONDS = 2.0
 READINGS = (
     ("cpu", "device_cpu_utilization_percent"),
@@ -182,21 +197,36 @@ def _by_device(result):
     return {r["metric"]["device_id"]: r for r in result if "device_id" in r["metric"]}
 
 
+def offline_limit(report_interval=None):
+    """Seconds of silence after which a device counts as OFFLINE: 3 x the interval it declares, never below 30 s.
+    A device that declares none (an older agent) is held to the 30 s floor. The dashboard and the alert use the
+    same rule (see docs/CONTRACT.md), so a device that reports slowly on purpose is not flagged."""
+    if report_interval is None or not report_interval > 0:  # also catches NaN
+        return OFFLINE_FLOOR
+    return max(OFFLINE_FLOOR, OFFLINE_FACTOR * report_interval)
+
+
 def fetch_devices():
-    """{device_id: info}. Same rule as the dashboard: OFFLINE when no sample for more than OFFLINE_AFTER seconds."""
+    """{device_id: info}. Same rule as the dashboard: OFFLINE when the silence exceeds the device's own limit."""
     ages = _by_device(prom(f"max by (device_id) (time() - tlast_over_time(device_uptime_seconds[{LOOKBACK}]))"))
     seen = _by_device(prom(f"topk by (device_id) (1, tlast_over_time(device_uptime_seconds[{LOOKBACK}]))"))
+    declared = _by_device(prom(f"max by (device_id) (last_over_time(device_report_interval_seconds[{LOOKBACK}]))"))
     latest = {k: _by_device(prom(f"max by (device_id) (last_over_time({m}[1m]))")) for k, m in READINGS}
     devices = {}
     for dev, r in ages.items():
         age = float(r["value"][1])
         s = seen.get(dev)
+        interval = float(declared[dev]["value"][1]) if dev in declared else None
+        limit = offline_limit(interval)
         info = {
             "device_id": dev,
             "hostname": (s or {}).get("metric", {}).get("hostname", ""),
-            "state": "ONLINE" if age <= OFFLINE_AFTER else "OFFLINE",
+            "state": "ONLINE" if age <= limit else "OFFLINE",
             "age_seconds": round(age, 1),
             "last_seen": float(s["value"][1]) if s else None,
+            "report_interval": interval,
+            "offline_after": limit,
+            "via": {"mqtt-bridge": "mqtt", "watcher": "watcher", "checkin": "checkin"}.get((s or {}).get("metric", {}).get("job"), "agent"),
         }
         for k, _ in READINGS:
             info[k] = float(latest[k][dev]["value"][1]) if dev in latest[k] else None
@@ -238,7 +268,7 @@ def expected_services():
 
 
 def compose_ps():
-    r = compose("ps", "-a", "--format", "{{.Service}}\t{{.State}}", capture=True)
+    r = compose("--profile", "*", "ps", "-a", "--format", "{{.Service}}\t{{.State}}", capture=True)
     out = {}
     for line in r.stdout.splitlines():
         parts = line.split("\t")
@@ -251,7 +281,7 @@ def missing_images():
     r = compose("config", "--images", capture=True)
     if r.returncode:
         return []
-    images = [i.strip() for i in r.stdout.splitlines() if i.strip()]
+    images = [i.strip() for i in r.stdout.splitlines() if i.strip() and i.strip() != BRIDGE_IMAGE]
     return [i for i in images if subprocess.run(["docker", "image", "inspect", i], capture_output=True).returncode]
 
 
@@ -267,12 +297,471 @@ def lan_ip():
 
 
 def service_checks():
-    """service -> (ok, detail), for the three services the stack needs."""
-    return {
+    """service -> (ok, detail), for the services the stack needs (plus the MQTT ones when MQTT is on)."""
+    checks = {
         "victoriametrics": (vm_healthy(), "healthy"),
         "otel-collector": (port_open("localhost", OTLP_PORT), f"port {OTLP_PORT} open"),
         "grafana": (grafana_healthy(), "healthy"),
     }
+    mode = mqtt_mode()
+    if mode == "bundled":
+        checks["mosquitto"] = (port_open("localhost", MQTT_PORT), f"port {MQTT_PORT} open")
+    if mode:
+        checks["mqtt-bridge"] = bridge_status()
+    if watch_enabled():
+        checks["watcher"] = (compose_ps().get("watcher") == "running", "running")
+    if checkin_enabled():
+        checks["checkin"] = (port_open("localhost", checkin_port()), f"port {checkin_port()} open")
+    return checks
+
+
+# ---------------------------------------------------------------- MQTT input (optional)
+# The settings live in .env, which Docker Compose reads by itself: COMPOSE_PROFILES switches the MQTT services on,
+# the MQTT_* values tell the bridge (and the bundled broker) where to connect and how to log in.
+def read_env():
+    values = {}
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    values[key.strip()] = val.strip().strip("'\"")
+    except FileNotFoundError:
+        pass
+    return values
+
+
+def env_quote(value):
+    if re.fullmatch(r"[A-Za-z0-9_.:/@%+,=-]*", value):
+        return value
+    if any(c in value for c in "'\n\r\0"):
+        raise FleetError("a value for .env may not contain a quote, a line break or a NUL character")
+    return f"'{value}'"  # single quotes: Docker Compose then takes it literally ($ and spaces included)
+
+
+def write_env(updates):
+    """Change only the given keys in .env (None removes one); every other line is kept. Private to the owner."""
+    try:
+        with open(ENV_FILE) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = ["# Written by ./fleet. Holds the MQTT, watcher and check-in settings; the passwords and the check-in key are secrets: do not share or commit this file."]
+    done, out = set(), []
+    for line in lines:
+        key = line.partition("=")[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
+        if key in updates:
+            done.add(key)
+            if updates[key] is not None:
+                out.append(f"{key}={env_quote(updates[key])}")
+        else:
+            out.append(line)
+    out += [f"{k}={env_quote(v)}" for k, v in updates.items() if k not in done and v is not None]
+    tmp = ENV_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, ENV_FILE)
+
+
+def mqtt_mode(env=None):
+    """'bundled' (our broker), 'external' (a broker you already run) or None (MQTT is off)."""
+    profiles = (env if env is not None else read_env()).get("COMPOSE_PROFILES", "").split(",")
+    return "bundled" if "mqtt" in profiles else "external" if "mqtt-bridge" in profiles else None
+
+
+def other_profiles(env):
+    return [p for p in env.get("COMPOSE_PROFILES", "").split(",") if p and p not in ("mqtt", "mqtt-bridge")]
+
+
+def parse_broker(value):
+    """'host' or 'host:port' -> (host, port). Not a loopback address: inside the bridge's container that is the container."""
+    host, port = value.strip(), None
+    if host.count(":") == 1:
+        host, _, port = host.partition(":")
+    try:
+        number = int(port) if port is not None else MQTT_PORT  # "host:" is a typo, not "the default port"
+    except ValueError:
+        number = 0
+    if not HOST_RE.fullmatch(host) or not 0 < number < 65536:
+        raise FleetError(f"invalid broker address {value!r}: use HOST or HOST:PORT (a name or an IPv4 address)")
+    if host.lower() == "localhost" or host.startswith("127.") or host == "0.0.0.0":
+        raise FleetError(f"'{host}' would point at the bridge's own container. Use the address other machines "
+                         "use to reach that broker (for example 192.168.1.20).")
+    return host, number
+
+
+def apply_mqtt_args(args):
+    """Write the MQTT choice from `up --mqtt / --mqtt-broker / --no-mqtt` into .env. True when something was asked."""
+    if args.mqtt_user and not args.mqtt_broker:
+        raise FleetError("--mqtt-user goes with --mqtt-broker (the bundled broker's user is created for you)")
+    env = read_env()
+    keep = other_profiles(env)
+    if args.mqtt:
+        password = env.get("MQTT_PASSWORD") if mqtt_mode(env) == "bundled" and env.get("MQTT_PASSWORD") else secrets.token_hex(12)
+        write_env({"COMPOSE_PROFILES": ",".join(keep + ["mqtt"]), "MQTT_USERNAME": "fleet", "MQTT_PASSWORD": password,
+                   "MQTT_HOST": None, "MQTT_PORT": None})
+    elif args.mqtt_broker:
+        host, port = parse_broker(args.mqtt_broker)
+        user = args.mqtt_user or ""
+        password = ""
+        if user:
+            password = os.environ.get("FLEET_MQTT_PASSWORD") or ""
+            if not password and sys.stdin.isatty():
+                password = getpass.getpass(f"Password for '{user}' on {host}:{port} (input is hidden): ")
+            if not password:
+                raise FleetError("the broker password is needed: set FLEET_MQTT_PASSWORD, or run this in a terminal "
+                                 "to be asked (it is never taken from the command line)")
+        was_bundled = mqtt_mode(env) == "bundled"
+        write_env({"COMPOSE_PROFILES": ",".join(keep + ["mqtt-bridge"]), "MQTT_HOST": host, "MQTT_PORT": str(port),
+                   "MQTT_USERNAME": user, "MQTT_PASSWORD": password})
+        if was_bundled and subprocess.run(["docker", "compose", "--profile", "*", "rm", "-sf", "mosquitto"],
+                                          cwd=ROOT, capture_output=True).returncode:
+            raise FleetError("could not stop the bundled broker; see: docker compose --profile '*' ps")
+    elif args.no_mqtt:
+        write_env({"COMPOSE_PROFILES": ",".join(keep) or None, "MQTT_HOST": None, "MQTT_PORT": None,
+                   "MQTT_USERNAME": None, "MQTT_PASSWORD": None})
+        if subprocess.run(["docker", "compose", "--profile", "*", "rm", "-sf", "mosquitto", "mqtt-bridge"],
+                          cwd=ROOT, capture_output=True).returncode:
+            raise FleetError("could not stop the MQTT services; see: docker compose --profile '*' ps")
+    else:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------- watching things that cannot run the agent (optional)
+# `./fleet watch add` keeps the list in ./watch/targets.json and turns the `watch` compose profile on in .env; the
+# watcher container re-reads the file by itself, so adding or removing a target needs no restart.
+_WATCHER_MODULE = []
+
+
+def watcher_module():
+    """watcher/watcher.py, loaded by path: the very file that runs in the container, so the CLI and the service
+    validate a target by the same rules."""
+    if not _WATCHER_MODULE:
+        spec = importlib.util.spec_from_file_location("fleet_watcher", os.path.join(ROOT, "watcher", "watcher.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _WATCHER_MODULE.append(module)
+    return _WATCHER_MODULE[0]
+
+
+def watch_enabled(env=None):
+    return "watch" in (env if env is not None else read_env()).get("COMPOSE_PROFILES", "").split(",")
+
+
+def read_targets():
+    try:
+        with open(TARGETS_FILE) as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        raise FleetError(f"{TARGETS_FILE} cannot be read ({exc}). Fix it, or delete it to start the list again.")
+    targets = doc.get("targets") if isinstance(doc, dict) else None
+    if not isinstance(targets, list):
+        raise FleetError(f"{TARGETS_FILE} is not a target list. Fix it, or delete it to start the list again.")
+    return [t for t in targets if isinstance(t, dict)]
+
+
+def write_targets(targets):
+    try:
+        os.makedirs(WATCH_DIR, exist_ok=True)
+        tmp = TARGETS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": 1, "targets": targets}, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp, 0o644)  # the container runs as another user without special rights: it must be able to read this
+        os.replace(tmp, TARGETS_FILE)
+    except OSError as exc:
+        raise FleetError(f"cannot write {TARGETS_FILE}: {exc}. If Docker created the 'watch' folder itself, "
+                         "remove it (sudo rm -r watch) and try again.")
+
+
+def set_watch_profile(on):
+    env = read_env()
+    profiles = [p for p in env.get("COMPOSE_PROFILES", "").split(",") if p and p != "watch"]
+    write_env({"COMPOSE_PROFILES": ",".join(profiles + (["watch"] if on else [])) or None})
+
+
+def start_watcher():
+    """Turn the watcher on (remembered in .env) and start it if it is not already running."""
+    set_watch_profile(True)
+    if compose_ps().get("watcher") == "running":
+        return
+    if subprocess.run(["docker", "image", "inspect", WATCHER_IMAGE], capture_output=True).returncode:
+        print(f"First time: downloading a small Python image ({WATCHER_IMAGE}, about 70 MB on disk) for the watcher.")
+    if subprocess.run(["docker", "compose", "up", "-d", "watcher"], cwd=ROOT).returncode:
+        raise FleetError("could not start the watcher; see the output above.")
+
+
+def watch_failure(device_id):
+    """What the watcher last said about this target if it is DOWN; None when it is UP or has not been heard of."""
+    r = compose("logs", "--no-log-prefix", "--tail", "200", "watcher", capture=True)
+    said = None
+    for line in r.stdout.splitlines():
+        m = re.match(r"^\S+ \S+ (?:INFO|WARNING|ERROR) " + re.escape(device_id) + r": (UP|DOWN) \((.*)\)$", line)
+        if m:
+            said = m.group(2) if m.group(1) == "DOWN" else None
+    return said
+
+
+def _seconds(value):
+    return int(value) if value is not None and value == int(value) else value
+
+
+def cmd_watch_add(args):
+    require_docker()
+    require_stack()
+    raw = {"id": args.device_id, "kind": args.kind, "target": args.target}
+    for key, value in (("interval", _seconds(args.interval)), ("timeout", _seconds(args.timeout)),
+                       ("expect_status", args.expect_status), ("max_series", args.max_series)):
+        if value is not None:
+            raw[key] = value
+    if args.insecure:
+        raw["insecure"] = True
+    try:
+        spec = watcher_module().validate_target(raw)
+    except ValueError as exc:
+        raise FleetError(str(exc))
+    device_id = spec["id"]
+    targets = read_targets()
+    if any(t.get("id") == device_id for t in targets):
+        raise FleetError(f"'{device_id}' is already watched. See: ./fleet watch list   "
+                         f"(to change it: ./fleet watch remove {device_id}, then add it again)")
+    existing = fetch_devices().get(device_id)
+    if existing and existing["state"] == "ONLINE":
+        raise FleetError(f"'{device_id}' is already reporting (via {existing['via']}, last seen "
+                         f"{fmt_age(existing['age_seconds'])} ago). Two devices with the same ID overwrite each other: pick another ID.")
+    host = (urllib.parse.urlsplit(spec["target"]).hostname if spec["kind"] in ("http", "metrics")
+            else spec["target"].rpartition(":")[0] if spec["kind"] == "tcp" else spec["target"])
+    write_targets(targets + [spec])
+    start_watcher()
+    limit = offline_limit(spec["interval"])
+    print(bold(f"Watching '{device_id}'") + f"   {spec['kind']} {spec['target']}, every {fmt_age(spec['interval'])}")
+    print(f"  It counts as OFFLINE after {fmt_age(limit)} without an answer, and appears on the dashboard the first time it answers.")
+    if host and host.lower().endswith(".local"):
+        print(yellow(f"  Note: '{host}' is a .local name (mDNS). Docker containers usually cannot resolve those; "
+                     "if it never answers, use the device's IP address instead."))
+    if args.no_wait:
+        return 0
+    print()
+    start = time.time()
+    next_look = start + WATCH_FIRST_LOOK
+    try:
+        while time.time() < start + args.wait:
+            d = fetch_devices().get(device_id)
+            if d and d["state"] == "ONLINE":
+                if sys.stdout.isatty():
+                    print(f"\r{' ' * 78}\r", end="")
+                print(f"{tick()} {bold(device_id)} answered after {int(time.time() - start)}s   See it: ./fleet check {device_id}")
+                return 0
+            if time.time() >= next_look:
+                next_look = time.time() + WATCH_LOOK_EVERY
+                reason = watch_failure(device_id)
+                if reason:
+                    if sys.stdout.isatty():
+                        print(f"\r{' ' * 78}\r", end="")
+                    print(yellow(f"Not answering: {reason}"))
+                    print(f"  It stays on the list and appears here the moment it answers. A typo? "
+                          f"./fleet watch remove {device_id}")
+                    return 1
+            if sys.stdout.isatty():
+                print(f"\r  waiting for '{device_id}' to answer... {int(time.time() - start)}s (Ctrl+C to stop waiting)", end="", flush=True)
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        print("\nStopped waiting. It will appear as soon as it answers.")
+        return 0
+    print(yellow(f"\nNo answer within {args.wait}s. It will appear as soon as it answers; to see why not: docker compose logs watcher"))
+    return 1
+
+
+def cmd_watch_list(args):
+    targets = read_targets()
+    devices = {}
+    if vm_healthy():
+        try:
+            devices = fetch_devices()
+        except FleetError:
+            pass
+    if args.json:
+        print(json.dumps([dict(t, state=(devices.get(t.get("id")) or {}).get("state")) for t in targets], indent=2))
+        return 0
+    if not targets:
+        print("Nothing is being watched.  Add something with: ./fleet watch add <id> ping|tcp|http|metrics <target>")
+        return 0
+    rows = []
+    for t in targets:
+        d = devices.get(t.get("id"))
+        rows.append([str(t.get("id")), str(t.get("kind")), str(t.get("target")), fmt_age(t.get("interval", 15)),
+                     d["state"] if d else ("waiting" if devices or vm_healthy() else "-"),
+                     fmt_age(d["age_seconds"]) + " ago" if d else "-"])
+
+    def colour(i, plain, padded):
+        if i == 4:
+            return green(padded) if plain == "ONLINE" else red(padded) if plain == "OFFLINE" else dim(padded)
+        return padded
+
+    table(["ID", "KIND", "TARGET", "EVERY", "STATE", "LAST ANSWER"], rows, colour)
+    if any(r[4] == "waiting" for r in rows):
+        print(dim("\n  'waiting' = it has not answered yet, so it is not on the dashboard. Why: docker compose logs watcher"))
+    if not watch_enabled():
+        print(dim("\n  The watcher is not turned on. Start it with: ./fleet up"))
+    return 0
+
+
+def cmd_watch_remove(args):
+    targets = read_targets()
+    if not any(t.get("id") == args.device_id for t in targets):
+        raise FleetError(f"'{args.device_id}' is not being watched. See: ./fleet watch list")
+    print(f"This stops watching '{args.device_id}' and deletes ALL its stored data. It cannot be undone.")
+    if not confirm("Stop watching and delete it? [y/N]", args.yes):
+        print("Aborted. Nothing was changed.")
+        return 1
+    rest = [t for t in targets if t.get("id") != args.device_id]
+    write_targets(rest)
+    if vm_healthy():
+        time.sleep(WATCH_SETTLE)  # the watcher notices the change within a second; a check already running may still report once
+        for attempt in range(2):
+            delete_device_data(args.device_id)
+            time.sleep(WATCH_SETTLE)
+            try:
+                if args.device_id not in fetch_devices():
+                    break
+            except FleetError:
+                break
+    if not rest and compose_ps().get("watcher"):
+        subprocess.run(["docker", "compose", "--profile", "*", "rm", "-sf", "watcher"], cwd=ROOT, capture_output=True)
+        set_watch_profile(False)
+        print(dim("  That was the last target, so the watcher was stopped too."))
+    print(f"{tick()} {bold('Stopped watching')} '{args.device_id}' and deleted its data.")
+    return 0
+
+
+# ---------------------------------------------------------------- the check-in URL (optional)
+# `./fleet add <id> --checkin` creates a key in .env, turns the `checkin` compose profile on and starts the service;
+# anything that can run curl then reports in with  curl "http://SERVER:8081/checkin/<id>?key=KEY&every=60".
+def checkin_enabled(env=None):
+    return "checkin" in (env if env is not None else read_env()).get("COMPOSE_PROFILES", "").split(",")
+
+
+def checkin_port(env=None):
+    value = (env if env is not None else read_env()).get("CHECKIN_PORT") or ""
+    return int(value) if value.isdigit() and 0 < int(value) < 65536 else CHECKIN_PORT
+
+
+def ensure_checkin():
+    """Make sure the check-in service has a key and is running. Returns (key, port)."""
+    env = read_env()
+    key, port = env.get("CHECKIN_KEY") or secrets.token_hex(12), checkin_port(env)
+    if compose_ps().get("checkin") != "running" and port_open("127.0.0.1", port):
+        raise FleetError(f"port {port} is already in use on this machine. Pick another: put CHECKIN_PORT=8090 (any free port) "
+                         "in the .env file, then run this again.")
+    profiles = [p for p in env.get("COMPOSE_PROFILES", "").split(",") if p and p != "checkin"] + ["checkin"]
+    write_env({"COMPOSE_PROFILES": ",".join(profiles), "CHECKIN_KEY": key})
+    if subprocess.run(["docker", "image", "inspect", WATCHER_IMAGE], capture_output=True).returncode:
+        print(f"First time: downloading a small Python image ({WATCHER_IMAGE}, about 70 MB on disk) for the check-in service.")
+    if subprocess.run(["docker", "compose", "up", "-d", "checkin"], cwd=ROOT).returncode:
+        raise FleetError("could not start the check-in service; see the output above.")
+    for _ in range(20):
+        try:
+            if http("GET", f"http://localhost:{port}/health", timeout=2)[0] == 200:
+                return key, port
+        except FleetError:
+            pass
+        time.sleep(1)
+    raise FleetError(f"the check-in service did not answer on port {port}. See: docker compose logs checkin")
+
+
+def stop_checkin():
+    """Turn the service off. The key stays in .env, so the commands you gave to devices work again if you turn it back on."""
+    env = read_env()
+    write_env({"COMPOSE_PROFILES": ",".join(p for p in env.get("COMPOSE_PROFILES", "").split(",") if p and p != "checkin") or None})
+    if subprocess.run(["docker", "compose", "--profile", "*", "rm", "-sf", "checkin"], cwd=ROOT, capture_output=True).returncode:
+        raise FleetError("could not stop the check-in service; see: docker compose --profile '*' ps")
+
+
+def cron_line(every):
+    """The crontab schedule for 'every N seconds', when cron can say it; None otherwise."""
+    if every == 60:
+        return "* * * * *"
+    if every % 60 == 0 and every < 3600 and 60 % (every // 60) == 0:
+        return f"*/{every // 60} * * * *"
+    if every % 3600 == 0 and 24 % (every // 3600) == 0:
+        return "0 * * * *" if every == 3600 else f"0 */{every // 3600} * * *"
+    return None
+
+
+def cmd_add_checkin(args, existing):
+    if not 5 <= args.every <= 28800:
+        raise FleetError("--every must be from 5 to 28800 seconds (8 hours: the dashboard looks back one day, and a device is OFFLINE after 3 times this)")
+    key, port = ensure_checkin()
+    host = args.host or lan_ip() or "localhost"
+    dev = args.device_id
+    url = f"http://{host}:{port}/checkin/{dev}?key={key}&every={args.every}"
+    print(bold(f"Add device '{dev}' by check-in URL"))
+    if existing:
+        print(yellow(f"  Note: '{dev}' reported before (offline for {fmt_age(existing['age_seconds'])}). "
+                     "If this is the same device, just start it again."))
+    print()
+    print(f"  Server   http://{host}:{port}")
+    print(f"  Key      {key}   {dim('shared by every device; treat it like a password. Plain HTTP: keep it on a network you trust')}")
+    print()
+    print("  From the device, run this each time it should report in. It works from anything that has curl:")
+    print(f'       curl -fsS -m 10 "{url}"')
+    cron = cron_line(args.every)
+    if cron:
+        print(f"  As a cron job (crontab -e):")
+        print(f'       {cron} curl -fsS -m 10 "{url}" >/dev/null')
+    print(f"  It counts as OFFLINE after {fmt_age(offline_limit(args.every))} without a check-in (3 x {fmt_age(args.every)}).")
+    print(f"  Add readings the same way, any name and a plain number:  ...&temperature_celsius=21.5&battery_volts=3.9")
+    print(dim("  A 'job finished' check-in: put the curl at the END of your script, so a failed run does not check in."))
+    if host != "localhost" and not args.host:
+        print(dim(f"  If this machine's address ({host}) can change (DHCP, phone hotspot), devices will stop "
+                  "reporting; reserve the address in your router, or pass --host with a stable name."))
+    if args.no_wait:
+        return 0
+    print()
+    try:
+        if wait_for_device(dev, args.timeout):
+            print(f"  See it: ./fleet check {dev}")
+            return 0
+    except KeyboardInterrupt:
+        print("\nStopped waiting. The device will still appear as soon as it checks in.")
+        return 0
+    print(yellow(f"Gave up waiting after {args.timeout}s. It will still appear once it checks in."))
+    print(f"  Not showing up? Run the curl above by hand and read what it says (it names a wrong key or a bad name), "
+          "or: docker compose logs checkin")
+    return 1
+
+
+def check_broker_port():
+    """Our own broker needs port 1883. If something else already listens there (often a broker you already run, such as
+    Home Assistant's Mosquitto), say so before Docker fails with a less helpful message."""
+    if "mosquitto" in compose_ps():
+        return  # that is ours, already running
+    if port_open("127.0.0.1", MQTT_PORT):
+        raise FleetError(f"port {MQTT_PORT} is already in use on this machine, probably by another MQTT broker. "
+                         f"Read that one instead:  ./fleet up --mqtt-broker {lan_ip() or 'THIS-MACHINE-ADDRESS'} "
+                         "--mqtt-user NAME   (or free the port and run this again)")
+
+
+def bridge_status():
+    """(ok, detail) from what the bridge last logged."""
+    r = compose("logs", "--no-log-prefix", "--tail", "60", "mqtt-bridge", capture=True)
+    state = (False, "starting")
+    for line in r.stdout.splitlines():
+        m = re.match(r"^\S+ \S+ (?:INFO|WARNING|ERROR) (.*)$", line)
+        if not m:
+            continue
+        text = m.group(1)
+        if text.startswith("starting:"):
+            state = (False, "starting")
+        elif text.startswith("connected to"):
+            state = (True, text.split(";")[0])
+        elif "refused the connection" in text or "cannot reach the broker" in text or "lost the connection" in text:
+            state = (False, text)
+    return state
 
 
 # ---------------------------------------------------------------- notifications (via Grafana's own API)
@@ -478,13 +967,29 @@ def cmd_notify_off(args):
 # ---------------------------------------------------------------- commands
 def cmd_up(args):
     require_docker()
+    if args.mqtt or (mqtt_mode() == "bundled" and not (args.mqtt_broker or args.no_mqtt)):
+        check_broker_port()  # before .env changes, so a refusal leaves everything as it was
+    asked = apply_mqtt_args(args)  # before anything starts, so a bad broker address stops here
+    mode = mqtt_mode()
     missing = missing_images()
-    if missing:
+    big = [i for i in missing if not i.startswith(("python:", "eclipse-mosquitto:"))]
+    if big:
         print(f"First run: downloading {len(missing)} image(s), about 590 MB in total (mostly Grafana).")
         print(dim("  This can take several minutes. Use a connection without a data cap."))
+    elif missing:
+        print(f"First run of this part: downloading {len(missing)} small image(s).")
+    if mode and subprocess.run(["docker", "image", "inspect", BRIDGE_IMAGE], capture_output=True).returncode:
+        print("First MQTT run: building the bridge (downloads a small Python image, about 70 MB).")
+        print(dim("  This needs internet access once."))
     started = time.time()
-    if subprocess.run(["docker", "compose", "up", "-d"], cwd=ROOT).returncode:
+    if args.no_checkin:
+        stop_checkin()
+    ps = compose_ps()
+    mounted = [svc for svc, on in (("watcher", watch_enabled()), ("checkin", checkin_enabled())) if on and ps.get(svc) == "running"]
+    if subprocess.run(["docker", "compose", "up", "-d"] + (["--build"] if mode else []), cwd=ROOT).returncode:
         raise FleetError("'docker compose up -d' failed; see the output above.")
+    if mounted:  # their scripts are mounted from ./watcher, so compose cannot tell they changed: restart them to run the current code
+        subprocess.run(["docker", "compose", "restart", *mounted], cwd=ROOT, capture_output=True)
     deadline = time.time() + args.timeout
     reported = set()
     while True:
@@ -497,7 +1002,10 @@ def cmd_up(args):
             break
         if time.time() > deadline:
             bad = [n for n, (ok, _) in pending.items() if not ok]
-            raise FleetError(f"not ready after {args.timeout}s: {', '.join(bad)}. "
+            why = ""
+            if "mqtt-bridge" in bad and pending["mqtt-bridge"][1] != "starting":
+                why = f" ({pending['mqtt-bridge'][1]})"  # e.g. the broker refused the login
+            raise FleetError(f"not ready after {args.timeout}s: {', '.join(bad)}{why}. "
                              f"See: docker compose logs {bad[0]}")
         time.sleep(1)
     ip = lan_ip()
@@ -511,6 +1019,13 @@ def cmd_up(args):
     elif login == "login":
         print("  Login       admin / the password you set")
     print(f"  Devices report to   {(ip or 'localhost')}:{OTLP_PORT}")
+    if mode == "bundled":
+        print(f"  MQTT broker         {(ip or 'localhost')}:{MQTT_PORT}   {dim('(user and password: ./fleet add <id> --mqtt)')}")
+    elif mode:
+        env = read_env()
+        print(f"  MQTT                bridge reads {env.get('MQTT_HOST')}:{env.get('MQTT_PORT')}")
+    elif asked:
+        print(dim("  MQTT is off."))
     print()
     try:
         n = len(fetch_devices())
@@ -537,7 +1052,10 @@ def cmd_down(args):
             online = sum(1 for d in fetch_devices().values() if d["state"] == "ONLINE")
         except FleetError:
             pass
-    print("This will stop the dashboard, the collector and the database.")
+    names = ["the dashboard", "the collector", "the database"]
+    names += [text for key, text in (("mosquitto", "the MQTT broker"), ("mqtt-bridge", "the MQTT bridge"),
+                                     ("watcher", "the watcher"), ("checkin", "the check-in service")) if key in present]
+    print("This will stop " + ", ".join(names[:-1]) + " and " + names[-1] + ".")
     if online:
         print(yellow(f"  {online} device(s) are online right now and will have nowhere to report "
                      "(their agents keep retrying until the stack is back)."))
@@ -552,7 +1070,7 @@ def cmd_down(args):
     if args.wipe and not confirm("Type 'wipe' to delete the stored data too:", args.yes, word="wipe"):
         print("Aborted. Nothing was changed.")
         return 1
-    cmd = ["docker", "compose", "down"] + (["-v"] if args.wipe else [])
+    cmd = ["docker", "compose", "--profile", "*", "down"] + (["-v"] if args.wipe else [])  # every profile: no orphans
     if subprocess.run(cmd, cwd=ROOT).returncode:
         raise FleetError("'docker compose down' failed; see the output above.")
     left = compose_ps()
@@ -628,6 +1146,15 @@ def cmd_check(args):
     print(f"{bold(d['device_id'])}   {state}   {dim('host ' + (d['hostname'] or '-'))}")
     seen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d["last_seen"])) if d["last_seen"] else "-"
     print(f"  last seen   {seen}  ({fmt_age(d['age_seconds'])} ago)")
+    if d["via"] == "mqtt":
+        print("  via         MQTT")
+    elif d["via"] == "checkin":
+        print("  via         check-in URL")
+    elif d["via"] == "watcher":
+        t = next((t for t in read_targets() if t.get("id") == d["device_id"]), None)
+        print(f"  via         watcher" + (f" ({t.get('kind')} {t.get('target')})" if t else ""))
+    if d["report_interval"] is not None:
+        print(f"  reports     every {fmt_age(d['report_interval'])}  (OFFLINE after {fmt_age(d['offline_after'])} of silence)")
     print(f"  CPU         {fmt_pct(d['cpu'])}")
     print(f"  memory      {fmt_pct(d['mem'])}")
     print(f"  disk        {fmt_pct(d['disk'])}")
@@ -655,8 +1182,10 @@ def wait_for_device(device_id, timeout):
         if d and d["state"] == "ONLINE":
             if sys.stdout.isatty():
                 print(f"\r{' ' * 78}\r", end="")  # wipe the "waiting..." line
+            readings = [f"{n} {f(d[k])}" for n, k, f in (("CPU", "cpu", fmt_pct), ("memory", "mem", fmt_pct), ("temp", "temp", fmt_temp))
+                        if d[k] is not None]
             print(f"{tick()} {bold(device_id)} is online after {int(time.time() - start)}s "
-                  f"{dim('(CPU ' + fmt_pct(d['cpu']) + ', memory ' + fmt_pct(d['mem']) + ', temp ' + fmt_temp(d['temp']) + ')')}")
+                  f"{dim('(' + (', '.join(readings) or 'via ' + d['via']) + ')')}")
             return True
         if sys.stdout.isatty():
             print(f"\r  waiting for '{device_id}' to report... {int(time.time() - start)}s (Ctrl+C to stop waiting)", end="", flush=True)
@@ -665,12 +1194,69 @@ def wait_for_device(device_id, timeout):
     return False
 
 
+def cmd_add_mqtt(args, existing):
+    mode = mqtt_mode()
+    if not mode:
+        raise FleetError("MQTT is not turned on. Start it with: ./fleet up --mqtt   "
+                         "(or ./fleet up --mqtt-broker HOST to use a broker you already run)")
+    env = read_env()
+    if mode == "bundled":
+        host, port = args.host or lan_ip() or "localhost", MQTT_PORT
+        user, password = env.get("MQTT_USERNAME", "fleet"), env.get("MQTT_PASSWORD", "")
+    else:
+        host, port = args.host or env.get("MQTT_HOST", ""), env.get("MQTT_PORT", str(MQTT_PORT))
+        user, password = env.get("MQTT_USERNAME", ""), "<your broker password>"
+    dev = args.device_id
+    auth = (f" -u {user} -P '{password}'" if user else "")
+    pub = f"mosquitto_pub -h {host} -p {port}{auth}"
+    print(bold(f"Add device '{dev}' over MQTT"))
+    if existing:
+        print(yellow(f"  Note: '{dev}' reported before (offline for {fmt_age(existing['age_seconds'])}). "
+                     "If this is the same device, just start it again."))
+    print()
+    print(f"  Broker     {host}:{port}   {dim('plain MQTT, no encryption: keep it on a network you trust')}")
+    if user:
+        print(f"  User       {user}")
+        print(f"  Password   {password}   {dim('shared by every device; treat it like a Wi-Fi password')}")
+    print()
+    print("  The device publishes plain numbers (21.5, not \"21.5C\" or JSON) to these topics:")
+    print(f"       fleet/{dev}/uptime_seconds            REQUIRED: any number that keeps growing, e.g. seconds since boot")
+    print(f"       fleet/{dev}/report_interval_seconds   how often it reports; it counts as OFFLINE after 3x this (min 30 s)")
+    print(f"       fleet/{dev}/temperature_celsius       any other reading: humidity_percent, battery_volts, ...")
+    print()
+    print("  Try it from any computer that has the mosquitto clients installed:")
+    print(f"       {pub} -t fleet/{dev}/report_interval_seconds -m 60 -r")
+    print(f"       {pub} -t fleet/{dev}/uptime_seconds -m 1")
+    print(f"       {pub} -t fleet/{dev}/temperature_celsius -m 21.5")
+    print(dim("  Board examples (MicroPython, Arduino, Python): docs/MQTT.md"))
+    if mode == "bundled" and host != "localhost" and not args.host:
+        print(dim(f"  If this machine's address ({host}) can change (DHCP, phone hotspot), devices will stop "
+                  "reporting; reserve the address in your router, or pass --host with a stable name."))
+    if args.no_wait:
+        return 0
+    print()
+    try:
+        if wait_for_device(dev, args.timeout):
+            print(f"  See it: ./fleet check {dev}")
+            return 0
+    except KeyboardInterrupt:
+        print("\nStopped waiting. The device will still appear as soon as it reports.")
+        return 0
+    print(yellow(f"Gave up waiting after {args.timeout}s. It will still appear once it reports."))
+    print("  Not showing up? Check the bridge:  docker compose logs mqtt-bridge   (it names bad topics and values)")
+    return 1
+
+
 def cmd_add(args):
     require_stack()
     existing = fetch_devices().get(args.device_id)
     if existing and existing["state"] == "ONLINE":
         raise FleetError(f"'{args.device_id}' is already reporting (last seen {fmt_age(existing['age_seconds'])} ago). "
                          "Two devices with the same ID overwrite each other: pick another ID.")
+    if args.mqtt:
+        return cmd_add_mqtt(args, existing)
+    if args.checkin:
+        return cmd_add_checkin(args, existing)
     host = args.host or lan_ip() or "localhost"
     endpoint = f"{host}:{OTLP_PORT}"
     print(bold(f"Add device '{args.device_id}'"))
@@ -695,6 +1281,8 @@ def cmd_add(args):
     print(dim("       undo later with:  sudo bash install-service.sh --uninstall"))
     print()
     print(f"  The device must be able to reach {endpoint}.")
+    print(dim(f"  Cannot install anything on it (a router, a NAS, a board running ESPHome)? Watch it instead: "
+              f"./fleet watch add {args.device_id} ping <address>"))
     print(dim("  If the device is THIS machine instead, run from the repo folder:"))
     print(dim("       python3 -m venv .venv && . .venv/bin/activate && pip install -r agent/requirements.txt"))
     print(dim(f"       python agent/device_agent.py --device-id {args.device_id}"))
@@ -720,6 +1308,9 @@ def cmd_add(args):
 
 def cmd_remove(args):
     require_stack()
+    if any(t.get("id") == args.device_id for t in read_targets()):
+        raise FleetError(f"'{args.device_id}' is being watched, so it would come straight back. "
+                         f"Use: ./fleet watch remove {args.device_id}")
     d = fetch_devices().get(args.device_id)
     if not d:
         raise FleetError(f"no device '{args.device_id}' has reported in the last 24 hours, so there is nothing to remove. "
@@ -759,6 +1350,14 @@ def build_parser():
 
     s = sub.add_parser("up", help="start everything and wait until it is ready")
     s.add_argument("--timeout", type=int, default=120, help="seconds to wait for the services after start (default 120)")
+    s.add_argument("--no-checkin", action="store_true", help="turn the check-in URL service off again")
+    m = s.add_mutually_exclusive_group()
+    m.add_argument("--mqtt", action="store_true", help="also start the MQTT input with its own broker (remembered next time)")
+    m.add_argument("--mqtt-broker", metavar="HOST[:PORT]",
+                   help="also start the MQTT input, reading a broker you already run (remembered next time)")
+    m.add_argument("--no-mqtt", action="store_true", help="turn the MQTT input off again")
+    s.add_argument("--mqtt-user", metavar="NAME",
+                   help="with --mqtt-broker: the broker's user name (the password comes from FLEET_MQTT_PASSWORD or a prompt)")
     s.set_defaults(func=cmd_up)
 
     s = sub.add_parser("down", help="stop everything (asks first)")
@@ -779,6 +1378,10 @@ def build_parser():
 
     s = sub.add_parser("add", help="onboard a device: shows what to run on it, waits for it to appear")
     s.add_argument("device_id", metavar="id", type=device_id_arg)
+    how = s.add_mutually_exclusive_group()
+    how.add_argument("--mqtt", action="store_true", help="the device reports over MQTT instead of running the agent")
+    how.add_argument("--checkin", action="store_true", help="the device reports by calling a URL (curl): a cron job, a script, a router")
+    s.add_argument("--every", type=int, default=60, metavar="SECONDS", help="with --checkin: how often it will check in (default 60)")
     s.add_argument("--host", help="address devices should use to reach this machine (default: detected LAN address)")
     s.add_argument("--no-wait", action="store_true", help="print the instructions and exit")
     s.add_argument("--timeout", type=int, default=180, help="seconds to wait for the device (default 180)")
@@ -789,6 +1392,31 @@ def build_parser():
     s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     s.add_argument("--force", action="store_true", help="delete even if the device is reporting right now")
     s.set_defaults(func=cmd_remove)
+
+    wp = sub.add_parser("watch", help="watch things that cannot run the agent: a ping, a port, a web page, a metrics endpoint")
+    wsub = wp.add_subparsers(dest="watch_cmd", metavar="<action>")
+    s = wsub.add_parser("add", help="start watching a target; it shows up like any device",
+                        description="Kinds: ping HOST | tcp HOST:PORT | http URL | metrics URL (a Prometheus /metrics page, "
+                                    "for example ESPHome's or an exporter's: its numbers are stored too).")
+    s.add_argument("device_id", metavar="id", type=device_id_arg)
+    s.add_argument("kind", choices=["ping", "tcp", "http", "metrics"])
+    s.add_argument("target", help="host (ping), host:port (tcp) or an http(s):// address (http, metrics)")
+    s.add_argument("--interval", type=float, metavar="SECONDS", help="how often to check (default 15, 5 to 3600)")
+    s.add_argument("--timeout", type=float, metavar="SECONDS", help="how long to wait for an answer (default 5)")
+    s.add_argument("--expect-status", type=int, metavar="CODE", help="http only: the status that counts as healthy (default: any 2xx or 3xx)")
+    s.add_argument("--insecure", action="store_true", help="https only: accept a self-signed certificate")
+    s.add_argument("--max-series", type=int, metavar="N", help="metrics only: keep at most this many series (default 2000, up to 10000)")
+    s.add_argument("--no-wait", action="store_true", help="add it and exit without waiting for the first answer")
+    s.add_argument("--wait", type=int, default=60, metavar="SECONDS", help="how long to wait for the first answer (default 60)")
+    s.set_defaults(func=cmd_watch_add)
+    s = wsub.add_parser("list", help="everything that is being watched, and how it is doing")
+    s.add_argument("--json", action="store_true", help="machine-readable output")
+    s.set_defaults(func=cmd_watch_list)
+    s = wsub.add_parser("remove", help="stop watching a target (and delete its stored data, asks first)")
+    s.add_argument("device_id", metavar="id", type=device_id_arg)
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    s.set_defaults(func=cmd_watch_remove)
+    wp.set_defaults(func=lambda a: wp.print_help() or 0)
 
     n = sub.add_parser("notify", help="send alerts to Discord, Slack, Telegram or a webhook")
     nsub = n.add_subparsers(dest="notify_cmd", metavar="<action>")
