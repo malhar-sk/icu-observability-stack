@@ -1,6 +1,6 @@
 # Validation report
 
-Seven runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer and run G the MQTT input with the per-device offline limit (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+Eight runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer run G the MQTT input with the per-device offline limit, and run H `./fleet watch` (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
 **Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
 commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
 the server over the network**; see the items marked PARTIAL and the "Not validated" list.
@@ -195,6 +195,23 @@ local copy of `python:3.13-alpine` whose pip config trusts the sandbox proxy's C
 Dockerfile built through `./fleet up --mqtt`. (My first manual build used a scratchpad copy of the Dockerfile with the same
 fix.) A normal machine with ordinary internet access does not have this problem.
 
+## Run H: `./fleet watch` (x86_64, real containers, simulated targets)
+
+Run by an AI agent on the same x86_64 VM (Docker 29.9.2). The targets were a small web server in a container
+(`tests/fixtures/metrics_server.py`, on the compose network) and VictoriaMetrics' own `/metrics` page as a **real
+exporter**. **No real router, NAS, PLC, ESPHome board or Raspberry Pi was watched.**
+
+| Check | Result | Evidence |
+|---|---|---|
+| `scripts/validate_watch.sh` | PASS | **60 of 60** on the final code (about 6 minutes). An earlier full run, before the series limit was changed (issue 22), passed 56 of 56; a re-run in between scored 54 of 60 only because the watcher container was still running the old code and its log still held the earlier runs' lines (issue 28). It covers: a ping, a TCP port, a web page, a page that must answer 404, an ESPHome-style page and a real exporter all appearing ONLINE "via watcher"; the stored labels (exactly `device_id`, `job="watcher"`, `kind`); the probe series; scraped numbers under their own names; a hostile page; refusals that say why; the target stopped and started; the alert; a watcher restart; `watch remove`. |
+| Stop and start | PASS | With a 5 s interval, everything on the stopped container went OFFLINE **35 s** after it stopped (limit 30 s), `DeviceOffline` fired **73 s** after (34 s and 64 s in the earlier run), with the text "has not reported for ... (it is offline after 30 s of silence)". The target on another container stayed ONLINE with no alert. After starting it again everything was ONLINE after **11 s** (9 s earlier), its uptime had started over, and the alert cleared. |
+| A hostile metrics page | PASS | It served `device_uptime_seconds 999999`, `device_probe_success 0`, NaN, infinity and 2500 series. Our own series were not overwritten (uptime stayed small, probe success stayed 1), NaN and infinity were not stored, and the page was cut at the limit. The watcher logged each problem once. |
+| Refusals that say why | PASS | A web page given as a metrics target: "HTTP 200, but it is not Prometheus text (a web page?)". A host name that does not exist: "cannot resolve". Neither appears on the dashboard; `watch list` shows them as `waiting`. |
+| The watcher itself | PASS | Adding a target does not restart it; after `docker compose restart watcher` the same targets keep being watched. Plain `./fleet remove` refuses a watched id and names `watch remove`; `watch remove` deletes the target and exactly its data. |
+| Ping inside the container | PASS | Works with every capability dropped except `NET_RAW`, and a target that does not answer gives a non-zero exit code. On this host it also worked with no capability at all and as an unprivileged user, so I cannot say what other hosts allow; the service keeps `NET_RAW`. |
+| A real exporter's size | MEASURED | VictoriaMetrics' own `/metrics` is 73 KB with **1199 series**. That is more than my first limit of 1000 (see issue 22). |
+| Unit tests | PASS | **304 run, 303 pass, 1 skipped** (as root) in about 19 s: agent 34, fleet 35, notify 34, MQTT CLI 46, watch CLI 47, installer 16, bridge 26, provisioning 5, watcher 61. Shellcheck is clean on all three validation scripts and the installer. |
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -267,6 +284,13 @@ rendered dashboard; that was checked separately with screenshots.
 | 19 | A wider `device_id` column pushed the table past the panel and clipped the uptime column. | Low | Found in a screenshot of my own change. Fixed with fixed column widths; checked again ([05](img/05-mqtt-boards-in-fleet.png)). |
 | 20 | My first draft of `scripts/validate_mqtt.sh` polled a condition it had already evaluated once, and could not run a negated check. | Low | Found in review and by the first run (21 of 23). Fixed; the whole script re-run: 23 of 23. |
 | 21 | The Docker image tag `eclipse-mosquitto:2.1.2` does not exist on Docker Hub (the broker reports 2.1.2 under `:2`). | Low | Pinned to the real tag, `2.1.2-alpine`, which also has arm64 and 32-bit arm builds. |
+| 22 | The first limit on scraped series (1000) would have cut the first real exporter I tried (1199 series), and the cut is arbitrary (the first 1000 the page lists). | Medium | Found by parsing a real exporter's page. The default is now 2000, each target can ask for up to 10000 (`--max-series`), and the watcher logs it once when it cuts. |
+| 23 | An HTTP answer that promises more bytes than it delivers was accepted as a whole scrape, so a partial page would have been stored as if complete. | Medium | Found by a unit test. A short answer is now a failed check ("cut short"). |
+| 24 | A web page given as a metrics target would have counted as healthy with zero series. | Medium | Found in review. It is now a failed check, "not Prometheus text (a web page?)". |
+| 25 | For a device last seen on an earlier day, the "last seen" cell was clipped (`6, 03:50:41 PM`): my column widths in run G were too narrow. | Medium | Found in a screenshot while testing the watcher. Widened and checked again. |
+| 26 | The first draft of `scripts/validate_watch.sh` used `check "..." test ... && has ...`, which would have hidden a failing second half. | Low | Found in review; moved into helper functions, which I then ran on bad input to confirm they return failure. |
+| 27 | Docker Hub answered 429 (rate limit) when I tried to pull `prom/node-exporter`. | Environment | Not a defect. A real `node_exporter` was therefore not tried. |
+| 28 | A running watcher keeps the old code after the files change (its script is mounted into the container, so Docker cannot tell it changed), and my re-run of the validation scored 54 of 60 because of it. | Medium | `./fleet up` now restarts a running watcher, and the script counts only its own run's log lines. Re-run: 60 of 60. |
 
 ## Not validated
 
@@ -281,5 +305,7 @@ rendered dashboard; that was checked separately with screenshots.
 - **Any real MQTT board.** ESP32, Pico W, Arduino and other hardware never touched this. The MicroPython and Arduino examples in `docs/MQTT.md` were not run or compiled; only the shell and Python examples were run.
 - The MQTT input on a Raspberry Pi (both images are published for arm64, but nothing was started there), building the bridge image on a Pi, and a broker that requires TLS or speaks only MQTT 5 (not supported).
 - The MQTT input under load: the 500-device and 64-metric limits and the 20,000-reading buffer are unit-tested, not stress-tested.
+- **`./fleet watch` against anything real:** a router, a NAS, a PLC port, an ESPHome board, a Klipper or Prusa exporter, a real `node_exporter`, or a Raspberry Pi. Only a container, VictoriaMetrics' own exporter and ESPHome-style sample text were used.
+- **https targets, `--insecure` and certificate errors:** no TLS server was available, so none of that was run. IPv6 targets were not run either, and `.local` names were not tried (the guide says they usually do not resolve inside Docker).
 - Last Will handling (not implemented: a board is OFFLINE by silence) and topics from Tasmota, ESPHome, Zigbee2MQTT or Home Assistant (not mapped).
 - `install-service.sh` on a Raspberry Pi or any real device, a real power cycle, systemd older than 247 (the `ProtectProc` option would be ignored with a warning; not tried), other distributions, and a device with no internet (the installer needs it once).

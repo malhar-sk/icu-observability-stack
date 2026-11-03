@@ -15,7 +15,8 @@ watch **every device's health and connectivity on one Grafana dashboard** and ge
 device stops reporting. The server side is plain Docker Compose: OpenTelemetry Collector,
 VictoriaMetrics and Grafana. Boards that cannot run the agent (ESP32, Pico W and other
 microcontrollers, custom hardware) can report over **MQTT** instead; see
-[Boards that speak MQTT](#boards-that-speak-mqtt-optional).
+[Boards that speak MQTT](#boards-that-speak-mqtt-optional). Things you cannot install anything on (a router,
+a NAS, a service, an ESPHome board) can be [watched from the server](#things-you-cannot-install-anything-on-optional).
 
 ### Prerequisites
 
@@ -44,6 +45,7 @@ One helper, `./fleet`, runs everything below. Use it on the machine that hosts t
 | `./fleet check <id>` | One device in detail |
 | `./fleet add <id>` | Onboard a device: prints what to run on it and waits until it appears (`--mqtt` for a board that speaks MQTT) |
 | `./fleet remove <id>` | Forget a retired device (deletes its stored data, asks first) |
+| `./fleet watch add\|list\|remove` | Watch things you cannot install anything on: a [ping, a port, a web page or a metrics endpoint](#things-you-cannot-install-anything-on-optional) |
 | `./fleet notify set\|test\|status\|off` | Send alerts to Discord, Slack, Telegram or a webhook |
 
 It is a thin wrapper around `docker compose` and the stack's own APIs, so the plain commands still
@@ -204,6 +206,10 @@ Record results in [docs/VALIDATION.md](docs/VALIDATION.md).
 access control, labels, offline detection, the alert and that a bridge restart does not revive a dead board
 (about four minutes). It uses the IDs `test-m-a`, `test-m-b` and `test-m-slow` and removes them afterwards.
 
+`scripts/validate_watch.sh` does it for `./fleet watch`: a victim web server in a container, a ping, a port, pages
+and two metrics endpoints (one of them a real exporter), a hostile metrics page, the target stopped and started, and the
+alert (about six minutes). It uses the IDs `vt-*` and removes them afterwards.
+
 ---
 
 ## Configuration
@@ -286,6 +292,24 @@ reports (`report_interval_seconds`), so a board that wakes once a minute is not 
 broker? `./fleet up --mqtt-broker 192.168.1.20 --mqtt-user ha`. Turn it off with `./fleet up --no-mqtt`.
 Costs about 126 MB of disk and 18 MiB of RAM. Everything about it, with shell, Python, MicroPython and Arduino
 examples, is in [docs/MQTT.md](docs/MQTT.md).
+
+### Things you cannot install anything on (optional)
+
+A router, a NAS, a web service, a PLC's port, a Pi you only need to know is alive, an ESP32 running ESPHome: watch
+them from the server instead. They show up in the same dashboard with the same state and alert.
+
+```bash
+./fleet watch add router  ping    192.168.1.1
+./fleet watch add nas     tcp     192.168.1.20:445
+./fleet watch add pihole  http    http://192.168.1.2/admin/
+./fleet watch add printer metrics http://192.168.1.50:7125/metrics   # Prometheus text: its numbers are stored too
+./fleet watch list
+```
+
+A target is OFFLINE after 3 missed checks (45 s at the default 15 s interval). The first `watch add` starts a small
+watcher container from the stock Python image (nothing to build). Use IP addresses, not `.local` names: containers
+usually cannot resolve those. No logins or tokens can be sent. Details, options and troubleshooting:
+[docs/WATCH.md](docs/WATCH.md).
 
 > **Trusted networks only.** Port 4317 has **no authentication and no TLS**. Anyone who can reach it
 > can write metrics under any device name. Use it on a private LAN or VPN, never on the open internet.
@@ -375,7 +399,9 @@ limit: 30 s (six missed pushes) for the default agent, or 3 times the interval t
 `device_report_interval_seconds` when that is longer, so a device that reports slowly on purpose is not
 flagged. The `DeviceOffline` rule uses the same query, evaluated every 10 s, with a 30 s pending
 period, and produces one alert instance per device. Boards that speak MQTT join the same pipeline
-through a small bridge (`bridge/mqtt_bridge.py`) that writes their readings to VictoriaMetrics.
+through a small bridge (`bridge/mqtt_bridge.py`) that writes their readings to VictoriaMetrics, and things
+that cannot run anything are checked by a watcher (`watcher/watcher.py`) that writes the same series from
+the server's side. Either way the offline rule above is the only one.
 
 Vector (`vector.toml`) is not part of the default stack. It is parked behind the compose profile
 `legacy-vector` because its demo configuration is broken; do not start it expecting it to work.
@@ -387,6 +413,7 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 - **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there; on a device, `agent/install-service.sh` makes the agent start at boot (systemd only). Both `./fleet` and the installer were tested on x86_64 Linux; neither has been run on the Raspberry Pi.
 - **Notifications are opt-in.** Until you run `./fleet notify set ...`, an alert is visible only inside Grafana (and its API). `fleet notify` covers Discord, Slack, Telegram and webhooks, not email, and only the webhook path was tested end to end.
 - **Offline detection is not instant.** With the default agent it takes about a minute from the device stopping to the alert firing; a device that reports every N seconds is OFFLINE after 3N (at least 30 s), and the alert follows 30 s later.
+- **Watching is from the server's side only.** The watcher sees what its container sees, cannot send a login or token, and for a watched target "uptime" means time answering continuously, not time since boot. A target that has never answered is invisible, like any device. Tested against real containers and a real exporter (VictoriaMetrics' own `/metrics`) and ESPHome-style sample output; **no real ESPHome board, router or PLC was available**. See [docs/WATCH.md](docs/WATCH.md).
 - **MQTT is plain and shared.** No TLS, one shared password for all boards, our `fleet/<device_id>/<metric>` topic scheme only (Tasmota, ESPHome, Zigbee2MQTT and Home Assistant topics are not mapped), and no Last Will handling: a board is OFFLINE by silence. Tested with simulated devices and a real broker; **no real ESP32, Pico or Arduino was available**. See [docs/MQTT.md](docs/MQTT.md).
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
 - **Single node, demo scale.** One VictoriaMetrics, one Collector, one Grafana, no redundancy or retention tuning.

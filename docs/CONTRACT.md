@@ -117,6 +117,40 @@ is not involved.
 - **Broker (bundled).** User `fleet`, password generated into `.env` (mode 600, gitignored), access list `fleet/#`
   only, plain MQTT on 1883. Last Will / status topics are not used.
 
+## Watcher (optional; `docs/WATCH.md` is the user guide)
+
+Things that cannot run the agent (a router, a NAS, a service, a board that serves Prometheus text) are checked by
+`watcher/watcher.py` (compose service `watcher`, profile `watch`, target list in `watch/targets.json` managed by
+`./fleet watch`). Kinds: `ping HOST`, `tcp HOST:PORT`, `http URL`, `metrics URL`. Data path:
+`watcher -> VictoriaMetrics /api/v1/import/prometheus`; the OTel Collector is not involved.
+
+Written on **every** check, stamped with the time the check finished, labels `device_id`, `job="watcher"`, `kind`:
+
+| Series | Value |
+|---|---|
+| `device_probe_success` | 1 if the check succeeded, else 0 |
+| `device_probe_duration_seconds` | how long the check took (for ping: the reply time) |
+| `device_report_interval_seconds` | the target's check interval (so the limit above applies: `max(30 s, 3 x interval)`) |
+| `device_http_status_code` | the HTTP status, for `http` and `metrics` targets that got an answer |
+
+Written **only when the check succeeded**:
+
+| Series | Value |
+|---|---|
+| `device_uptime_seconds` | **observed uptime**: seconds the target has answered *continuously*. Zero on the first answer after a gap. This is not time since boot; it is the liveness signal, so a target that stops answering goes quiet and becomes OFFLINE like any other device. |
+| the scraped series (`metrics` only) | the target's own numbers under their own names, with the labels `device_id`, `job`, `kind` added. A scraped label of those names is kept as `exported_<name>`. |
+| `device_scrape_series` | how many scraped series were kept |
+
+- A target that has never answered is invisible (the same rule as for every device). `./fleet watch list` shows it as
+  `waiting`, and `./fleet watch add` reports why from the watcher's log.
+- **Reserved:** scraped names starting with `device_` are dropped, so a scraped page cannot overwrite the series above.
+  NaN and infinite values are dropped. At most `max_series` (default 2000, up to 10000, the first ones the page lists) and 5 MB are taken from one answer. A page that is not
+  Prometheus text (a web page) is a failed check, not a healthy target with no data.
+- `http` succeeds on 2xx and 3xx (after redirects), or on exactly `expect_status` when one is set. `metrics` needs 200
+  and at least one usable series. Certificates are verified unless the target says `insecure`.
+- Limits: 100 targets, interval 5 to 3600 s, timeout up to the interval. No login, token or header can be sent.
+- There is no `hostname` label (the table column shows `-`).
+
 ## Grafana (provisioned from files, nothing configured by hand)
 
 | Item | Value |

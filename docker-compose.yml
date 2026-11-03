@@ -67,6 +67,29 @@ services:
       MQTT_PASSWORD: ${MQTT_PASSWORD:-}
       VM_URL: http://victoriametrics:8428
 
+  # Watcher (optional): checks things that cannot run the agent (a ping, a port, a web page, a metrics endpoint such
+  # as ESPHome's) and reports them as devices. Off by default. `./fleet watch add ...` turns it on (it adds the profile
+  # to .env) and manages the target list in ./watch/targets.json. Runs the stock Python image: nothing to build.
+  watcher:
+    profiles: ["watch"]
+    image: python:3.13-alpine
+    restart: unless-stopped
+    command: ["python", "-u", "/app/watcher.py"]
+    environment:
+      VM_URL: http://victoriametrics:8428
+      TARGETS_FILE: /watch/targets.json
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./watcher:/app:ro
+      - ./watch:/watch:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW  # for ping
+
   # Not started by default: this demo pipeline is currently broken (the image reads
   # /etc/vector/vector.yaml, and the config wires log events into a metrics sink).
   # Start explicitly with: docker compose --profile legacy-vector up -d
