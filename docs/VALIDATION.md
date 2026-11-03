@@ -1,6 +1,6 @@
 # Validation report
 
-Eight runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer run G the MQTT input with the per-device offline limit, and run H `./fleet watch` (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+Nine runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer run G the MQTT input with the per-device offline limit, and run H `./fleet watch` and run I the check-in URL (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
 **Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
 commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
 the server over the network**; see the items marked PARTIAL and the "Not validated" list.
@@ -212,6 +212,23 @@ exporter**. **No real router, NAS, PLC, ESPHome board or Raspberry Pi was watche
 | A real exporter's size | MEASURED | VictoriaMetrics' own `/metrics` is 73 KB with **1199 series**. That is more than my first limit of 1000 (see issue 22). |
 | Unit tests | PASS | **304 run, 303 pass, 1 skipped** (as root) in about 19 s: agent 34, fleet 35, notify 34, MQTT CLI 46, watch CLI 47, installer 16, bridge 26, provisioning 5, watcher 61. Shellcheck is clean on all three validation scripts and the installer. |
 
+## Run I: the check-in URL (x86_64, real container, real `curl`)
+
+Run by an AI agent on the same x86_64 VM. The service ran in its container; the devices were `curl` commands from the
+same machine. **No router, `wget`, or board calling the URL itself was tried.**
+
+| Check | Result | Evidence |
+|---|---|---|
+| `scripts/validate_checkin.sh` | PASS | **30 of 30** (about 3 minutes). `./fleet add --checkin` started the service, created a 24-character key, and printed the exact command the script then used. |
+| Refusals | PASS | A wrong key and no key: 401. A bad id, a reading that is not a number, and an interval that is too long: 400 with the reason. An unknown path: 404. Nothing was stored for any of them. |
+| A check-in becomes a device | PASS | Appeared ONLINE 14 s after the first `curl`, "via checkin", with exactly the labels `device_id` and `job="checkin"`; readings (`temperature_celsius`, `battery_volts`) and the declared interval were stored. |
+| The key stays secret | PASS | The service's log does not contain it (the web server's own request log, which would hold the address, is switched off; a unit test also checks this through a real server). |
+| A slow device | PASS | A device that declared `every=60` was still ONLINE 45 s after its only check-in. |
+| Offline, alert, recovery | PASS | A device that declared nothing was OFFLINE 45 s after its only check-in (the rule is 30 s; the extra is the time for the check to see it), `DeviceOffline` fired **75 s** after, a new check-in brought it back ONLINE with its uptime restarted, and the alert cleared. The slow device never alerted. |
+| The off switch | PASS | `./fleet up --no-checkin` stopped the service, kept the key, and turning it on again accepted the same key. |
+| Unit tests | PASS | **351 run, 350 pass, 1 skipped** (as root) in about 30 s: agent 34, fleet 35, notify 34, MQTT CLI 46, watch CLI 47, check-in CLI 21, installer 16, bridge 26, provisioning 5, watcher 61, check-in service 26. Shellcheck is clean on every script. |
+| The README workflow | PARTIAL | Every command the new Quickstart shows is one the scripts above ran (apart from the Docker install line and the `scp`/venv steps on a separate device). Links between the documents were checked mechanically. **Nobody has followed the new README cold.** |
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -291,6 +308,7 @@ rendered dashboard; that was checked separately with screenshots.
 | 26 | The first draft of `scripts/validate_watch.sh` used `check "..." test ... && has ...`, which would have hidden a failing second half. | Low | Found in review; moved into helper functions, which I then ran on bad input to confirm they return failure. |
 | 27 | Docker Hub answered 429 (rate limit) when I tried to pull `prom/node-exporter`. | Environment | Not a defect. A real `node_exporter` was therefore not tried. |
 | 28 | A running watcher keeps the old code after the files change (its script is mounted into the container, so Docker cannot tell it changed), and my re-run of the validation scored 54 of 60 because of it. | Medium | `./fleet up` now restarts a running watcher, and the script counts only its own run's log lines. Re-run: 60 of 60. |
+| 29 | The MQTT bridge accepted a declared interval up to 86400 s, but the dashboard only looks back one day, so such a board would have vanished after a day instead of showing OFFLINE. | Low | Found while writing the check-in service. The limit is now 28800 s (8 h) for MQTT and the check-in URL alike. |
 
 ## Not validated
 
@@ -305,6 +323,8 @@ rendered dashboard; that was checked separately with screenshots.
 - **Any real MQTT board.** ESP32, Pico W, Arduino and other hardware never touched this. The MicroPython and Arduino examples in `docs/MQTT.md` were not run or compiled; only the shell and Python examples were run.
 - The MQTT input on a Raspberry Pi (both images are published for arm64, but nothing was started there), building the bridge image on a Pi, and a broker that requires TLS or speaks only MQTT 5 (not supported).
 - The MQTT input under load: the 500-device and 64-metric limits and the 20,000-reading buffer are unit-tested, not stress-tested.
+- **The check-in URL from anything but `curl` on the server itself:** a router, `wget`, a microcontroller, a machine on another network. It was also not tried with IPv6 or behind a reverse proxy.
+- **The new README workflow followed by a person** on a fresh laptop or Pi, including Docker's installer script (not run here).
 - **`./fleet watch` against anything real:** a router, a NAS, a PLC port, an ESPHome board, a Klipper or Prusa exporter, a real `node_exporter`, or a Raspberry Pi. Only a container, VictoriaMetrics' own exporter and ESPHome-style sample text were used.
 - **https targets, `--insecure` and certificate errors:** no TLS server was available, so none of that was run. IPv6 targets were not run either, and `.local` names were not tried (the guide says they usually do not resolve inside Docker).
 - Last Will handling (not implemented: a board is OFFLINE by silence) and topics from Tasmota, ESPHome, Zigbee2MQTT or Home Assistant (not mapped).

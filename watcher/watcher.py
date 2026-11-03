@@ -376,30 +376,87 @@ def format_line(name, labels, value, stamp_ms):
 
 
 # ------------------------------------------------------------------ the watcher
-class Watcher:
-    """Runs the checks that are due, turns the results into metric lines, and delivers them to VictoriaMetrics.
-    Thread safe: checks run in a pool while the main loop flushes."""
+class Pusher:
+    """Delivers Prometheus text lines to VictoriaMetrics from a bounded buffer, and logs a problem once rather than every
+    second. The watcher and the check-in service (watcher/checkin.py) both use it. Thread safe."""
 
-    def __init__(self, vm_url, clock=time.time, probes=None):
+    def __init__(self, vm_url):
         self.vm_url = vm_url.rstrip("/")
-        self.clock = clock
-        self.probes = probes or {}      # kind -> function(spec) -> Result; tests replace it
         self.lock = threading.Lock()
         self.pending = []
-        self.targets = {}               # id -> spec
-        self.state = {}                 # id -> {"since": streak start or None, "up": last outcome or None}
-        self.next_due = {}
-        self.inflight = set()
         self.warned = set()
         self.vm_ok = True
-        self.stats = {"checks": 0, "failed": 0, "delivered": 0, "dropped_unsent": 0}
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.stats = {"delivered": 0, "dropped_unsent": 0}
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # a local service: never via a proxy
 
     def warn_once(self, key, message, *args):
         if key in self.warned or len(self.warned) >= MAX_WARNINGS:
             return
         self.warned.add(key)
         log.warning(message, *args)
+
+    def _extend_locked(self, lines):
+        """Add lines to the buffer (the caller holds the lock); the oldest go first once it is full."""
+        self.pending.extend(lines)
+        overflow = len(self.pending) - MAX_BUFFER
+        if overflow > 0:
+            del self.pending[:overflow]
+            self.stats["dropped_unsent"] += overflow
+
+    def add_lines(self, lines):
+        with self.lock:
+            self._extend_locked(lines)
+
+    def flush(self):
+        with self.lock:
+            lines, self.pending = self.pending, []
+        if not lines:
+            return 0
+        body = ("\n".join(lines) + "\n").encode()
+        request = urllib.request.Request(self.vm_url + "/api/v1/import/prometheus", data=body, method="POST")
+        try:
+            with self._opener.open(request, timeout=10) as response:
+                response.read()
+        except (urllib.error.URLError, OSError) as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
+            with self.lock:
+                self.pending = lines + self.pending
+                overflow = len(self.pending) - MAX_BUFFER
+                if overflow > 0:
+                    del self.pending[:overflow]
+                    self.stats["dropped_unsent"] += overflow
+            raise
+        self.stats["delivered"] += len(lines)
+        return len(lines)
+
+    def flush_logged(self):
+        try:
+            sent = self.flush()
+        except (urllib.error.URLError, OSError) as exc:
+            if self.vm_ok:
+                log.error("cannot reach VictoriaMetrics at %s (%s); keeping results and retrying", self.vm_url, exc)
+            self.vm_ok = False
+            return 0
+        if not self.vm_ok:
+            log.info("VictoriaMetrics is reachable again")
+            self.vm_ok = True
+        return sent
+
+
+class Watcher(Pusher):
+    """Runs the checks that are due, turns the results into metric lines, and delivers them to VictoriaMetrics.
+    Thread safe: checks run in a pool while the main loop flushes."""
+
+    def __init__(self, vm_url, clock=time.time, probes=None):
+        super().__init__(vm_url)
+        self.clock = clock
+        self.probes = probes or {}      # kind -> function(spec) -> Result; tests replace it
+        self.targets = {}               # id -> spec
+        self.state = {}                 # id -> {"since": streak start or None, "up": last outcome or None}
+        self.next_due = {}
+        self.inflight = set()
+        self.stats.update(checks=0, failed=0)
 
     # ---- the list of targets
     def apply_targets(self, specs):
@@ -485,11 +542,7 @@ class Watcher:
                 self.stats["failed"] += 1
             changed = state["up"] != result.ok
             state["up"] = result.ok
-            self.pending.extend(lines)
-            overflow = len(self.pending) - MAX_BUFFER
-            if overflow > 0:
-                del self.pending[:overflow]
-                self.stats["dropped_unsent"] += overflow
+            self._extend_locked(lines)
         what = f"{spec['kind']} {spec['target']}"
         if changed:
             (log.info if result.ok else log.warning)("%s: %s (%s: %s)", device_id, "UP" if result.ok else "DOWN", what, result.detail)
@@ -500,43 +553,6 @@ class Watcher:
                           ("bad_lines", "lines that are not Prometheus text were skipped")):
             if result.extra.get(key):
                 self.warn_once((key, device_id), "%s: %s (%d in the latest check)", device_id, text, result.extra[key])
-
-    # ---- delivery
-    def flush(self):
-        with self.lock:
-            lines, self.pending = self.pending, []
-        if not lines:
-            return 0
-        body = ("\n".join(lines) + "\n").encode()
-        request = urllib.request.Request(self.vm_url + "/api/v1/import/prometheus", data=body, method="POST")
-        try:
-            with self._opener.open(request, timeout=10) as response:
-                response.read()
-        except (urllib.error.URLError, OSError) as exc:
-            if isinstance(exc, urllib.error.HTTPError):
-                exc.close()
-            with self.lock:
-                self.pending = lines + self.pending
-                overflow = len(self.pending) - MAX_BUFFER
-                if overflow > 0:
-                    del self.pending[:overflow]
-                    self.stats["dropped_unsent"] += overflow
-            raise
-        self.stats["delivered"] += len(lines)
-        return len(lines)
-
-    def flush_logged(self):
-        try:
-            sent = self.flush()
-        except (urllib.error.URLError, OSError) as exc:
-            if self.vm_ok:
-                log.error("cannot reach VictoriaMetrics at %s (%s); keeping results and retrying", self.vm_url, exc)
-            self.vm_ok = False
-            return 0
-        if not self.vm_ok:
-            log.info("VictoriaMetrics is reachable again")
-            self.vm_ok = True
-        return sent
 
 
 # ------------------------------------------------------------------ the service

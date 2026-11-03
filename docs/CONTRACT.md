@@ -112,7 +112,7 @@ is not involved.
 - **Timestamps are the bridge's arrival time**, not the board's. If VictoriaMetrics is unreachable the bridge keeps up
   to 20,000 lines and delivers them with their original arrival times.
 - **Retained messages are never readings** (the broker replays them on every reconnect, so they would make a dead
-  device look alive). The one exception is `report_interval_seconds`, which is configuration: valid range 0 to 86400.
+  device look alive). The one exception is `report_interval_seconds`, which is configuration: valid range above 0 and up to 28800 (8 h: the limit, 3 x, must stay inside the one-day lookback).
 - **Limits.** 500 devices, 64 metrics per device.
 - **Broker (bundled).** User `fleet`, password generated into `.env` (mode 600, gitignored), access list `fleet/#`
   only, plain MQTT on 1883. Last Will / status topics are not used.
@@ -150,6 +150,32 @@ Written **only when the check succeeded**:
   and at least one usable series. Certificates are verified unless the target says `insecure`.
 - Limits: 100 targets, interval 5 to 3600 s, timeout up to the interval. No login, token or header can be sent.
 - There is no `hostname` label (the table column shows `-`).
+
+## Check-in URL (optional; `docs/CHECKIN.md` is the user guide)
+
+Anything that can run `curl` reports in through `watcher/checkin.py` (compose service `checkin`, profile `checkin`,
+published on port 8081, key in `.env` as `CHECKIN_KEY`). Data path: `curl -> checkin -> VictoriaMetrics
+/api/v1/import/prometheus`; the OTel Collector is not involved.
+
+`GET` or `POST /checkin/<device_id>?key=KEY[&every=SECONDS][&<name>=<number>...]`
+
+| Part | Rule |
+|---|---|
+| `key` | must equal `CHECKIN_KEY`, else 401. Never written to a log. |
+| `<device_id>` | the device id rule above, else 400 |
+| `every` | optional, 5 to 28800 s (8 h, so the 3 x limit stays inside the one-day lookback). It is remembered per device by the service, so a later check-in without it keeps the last value. |
+| `<name>=<number>` | a reading: `^[a-z][a-z0-9_]{0,62}$`, a plain finite number, stored as `device_<name>`; at most 64 per request; `report_interval_seconds` is refused (use `every`); `uptime_seconds` overrides the uptime below |
+| answer | 200 `ok`; 400 with the reason; 401; 404; 414 (address over 2000 characters); 503 (more than 500 devices) |
+
+Written per check-in, stamped on arrival, labels `device_id` and `job="checkin"` (no `hostname`, no `instance`):
+
+| Series | Value |
+|---|---|
+| `device_uptime_seconds` | **observed**: seconds the device has checked in continuously. It starts over when the gap since the last check-in exceeds the limit (`max(30 s, 3 x every)`; 30 s while no `every` is known). Or the value the device sent as `uptime_seconds`. |
+| `device_report_interval_seconds` | the declared `every`, when known |
+| `device_<name>` | each reading |
+
+A device that has never checked in is invisible (the same rule as for every device).
 
 ## Grafana (provisioned from files, nothing configured by hand)
 

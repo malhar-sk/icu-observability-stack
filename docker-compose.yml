@@ -90,6 +90,28 @@ services:
     cap_add:
       - NET_RAW  # for ping
 
+  # Check-in URL (optional): anything that can run curl reports in with
+  #   curl "http://SERVER:8081/checkin/<device_id>?key=KEY&every=60"
+  # Off by default. `./fleet add <id> --checkin` turns it on (it creates the key in .env and adds the profile).
+  checkin:
+    profiles: ["checkin"]
+    image: python:3.13-alpine
+    restart: unless-stopped
+    command: ["python", "-u", "/app/checkin.py"]
+    environment:
+      VM_URL: http://victoriametrics:8428
+      CHECKIN_KEY: ${CHECKIN_KEY:-}
+      PYTHONDONTWRITEBYTECODE: "1"
+    ports:
+      - "${CHECKIN_PORT:-8081}:8081"
+    volumes:
+      - ./watcher:/app:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
   # Not started by default: this demo pipeline is currently broken (the image reads
   # /etc/vector/vector.yaml, and the config wires log events into a metrics sink).
   # Start explicitly with: docker compose --profile legacy-vector up -d
