@@ -1,6 +1,6 @@
 # Validation report
 
-Nine runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer run G the MQTT input with the per-device offline limit, and run H `./fleet watch` and run I the check-in URL (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+Ten runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer run G the MQTT input with the per-device offline limit, and run H `./fleet watch` run I the check-in URL, and run J the owner's Raspberry Pi 5 and ntfy notifications (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
 **Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
 commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
 the server over the network**; see the items marked PARTIAL and the "Not validated" list.
@@ -229,6 +229,37 @@ same machine. **No router, `wget`, or board calling the URL itself was tried.**
 | Unit tests | PASS | **351 run, 350 pass, 1 skipped** (as root) in about 30 s: agent 34, fleet 35, notify 34, MQTT CLI 46, watch CLI 47, check-in CLI 21, installer 16, bridge 26, provisioning 5, watcher 61, check-in service 26. Shellcheck is clean on every script. |
 | The README workflow | PARTIAL | Every command the new Quickstart shows is one the scripts above ran (apart from the Docker install line and the `scp`/venv steps on a separate device). Links between the documents were checked mechanically. **Nobody has followed the new README cold.** |
 
+## Run J: the owner's Raspberry Pi 5, and ntfy notifications
+
+**Part 1: a Raspberry Pi 5, run by its owner** (host `SOVEREIGN`, arm64, Debian 13) at the keyboard over SSH, with an AI
+giving the commands. The evidence is the terminal output they pasted back. The first steps (switching the repository to
+`main`, `./fleet up`, opening the dashboard) were done before the pasted output begins, so their output is not recorded here.
+
+| Check | Result | Evidence |
+|---|---|---|
+| The agent installed as a service | PASS | `install-service.sh` printed "device-agent is running and will start at boot"; `./fleet list`: `sovereign` ONLINE with CPU 0.8%, memory 15.4%, disk 23.0%, **37.5C** (the Pi's real sensor) and uptime 5m 16s. |
+| The busy-port message, on real hardware | PASS | `./fleet add test-curl --checkin` stopped with "port 8081 is already in use on this machine. Pick another..." because something else on the Pi holds 8081 (what it is was not identified). Following the advice (`CHECKIN_PORT=8090` in `.env`) worked. |
+| The check-in URL | PASS | The Python image pulled in 13.2 s and the service started in 1.6 s. The printed `curl` command was run by the owner, and `test-curl` appeared ONLINE "via check-in URL", reporting every 1m 00s (the 80 s the command waited includes the time to run the command by hand). |
+| Watching, with a ping from inside the container | PASS | `./fleet watch add router ping 10.11.111.101`: "answered after 6s"; `./fleet watch list` showed it ONLINE, 3 s ago. This is the case I could not test before: ICMP from a container with every capability dropped except `NET_RAW`, on arm64. |
+| The MQTT broker and bridge on arm64 | PASS | `./fleet up --mqtt` took 21 s: the Mosquitto image pulled in 9.8 s, and the bridge image **built from the repo's Dockerfile in 8.5 s** (pip install 5.3 s). All seven checks passed, including "mqtt-bridge connected to mosquitto:1883". |
+| A simulated MQTT board | PASS | Three `mosquitto_pub` commands from the Pi: `test-board` appeared ONLINE "via MQTT" with 21.5C, reporting every 1m 00s (OFFLINE after 3m 00s). |
+| Not done on the Pi | | An alert firing there, a notification reaching a phone, a reboot, a separate device pushing across the network, and a real MQTT board. |
+
+**Part 2: ntfy notifications** (x86_64 sandbox, real Grafana 13.3.0; the sandbox cannot reach ntfy.sh, so a stand-in ntfy
+server recorded every request). ntfy has no Grafana contact-point type, so `./fleet notify set ntfy` saves a Grafana
+**webhook** whose custom payload is an ntfy JSON message (`topic`, `title`, `message`, `priority`, `tags`), posted to the
+server's root address. The message format comes from my knowledge of ntfy's JSON publishing; I could not read ntfy's
+documentation or reach a real server from here.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Grafana renders the template into valid ntfy JSON | PASS | The test message arrived as `POST /`, `application/json`, body `{"topic":"fleet-test-topic","title":"Device offline","message":"Notification test\n","priority":4,"tags":["rotating_light"]}`, which parses. |
+| A real alert: a device goes quiet | PASS | A new device checked in once; the stand-in received, **79.7 s later** (by its own clock), "Device offline", priority 4, tag `rotating_light`, "Device ntfy-trial has not reported for 65 s (it is offline after 30 s of silence)". One message per device. |
+| A real alert: the device comes back | PASS | **57.9 s** after it checked in again: "Device back online", priority 3, tag `white_check_mark`, "ntfy-trial is reporting again". |
+| The topic stays private in our output | PASS | `notify status` shows only `ntfy (http://host:port/...)`, never the topic; `--random-topic` says the topic once, when it is made. |
+| Unit tests | PASS | **370 run, 369 pass, 1 skipped** (as root) in about 31 s, including 18 new ntfy tests and one for the friendlier `watch add` error. A "golden" test pins the exact template that was run through Grafana, so changing it forces a re-check. |
+| **Not tested** | | The real ntfy.sh, the ntfy phone app, a self-hosted ntfy with login or tokens (not supported), and Telegram, Discord and Slack against the real services. Whether iPhone push through ntfy.sh behaves differently from Android was not looked into. |
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -309,23 +340,25 @@ rendered dashboard; that was checked separately with screenshots.
 | 27 | Docker Hub answered 429 (rate limit) when I tried to pull `prom/node-exporter`. | Environment | Not a defect. A real `node_exporter` was therefore not tried. |
 | 28 | A running watcher keeps the old code after the files change (its script is mounted into the container, so Docker cannot tell it changed), and my re-run of the validation scored 54 of 60 because of it. | Medium | `./fleet up` now restarts a running watcher, and the script counts only its own run's log lines. Re-run: 60 of 60. |
 | 29 | The MQTT bridge accepted a declared interval up to 86400 s, but the dashboard only looks back one day, so such a board would have vanished after a day instead of showing OFFLINE. | Low | Found while writing the check-in service. The limit is now 28800 s (8 h) for MQTT and the check-in URL alike. |
+| 30 | Leaving the kind out of `./fleet watch add router 10.0.0.1` gave "invalid choice: '10.0.0.1' (choose from ping, tcp, http, metrics)", which does not say what to do. | Low | Found when the owner typed it on the Pi. The error now shows the form and the fix with their own address: `./fleet watch add router ping 10.0.0.1`. |
+| 31 | My first two timing scripts for the ntfy test counted messages left over from earlier runs in the same log and reported an impossible result (an OFFLINE message 9 s after a check-in). | Process | Noticed because the number was impossible. Redone with an emptied log, a new device name, and the stand-in server's own timestamps. |
 
 ## Not validated
 
 - A separate device pushing to the server over the network (port 4317 from another machine), or any firewall behaviour.
 - 32-bit Raspberry Pi OS, Pi Zero-class hardware, and ESP32-class devices (the agent is Linux-only; an HTTP path to port 4318 worked in a `curl` test only).
-- `./fleet` on the Raspberry Pi, `./fleet remove --force` on a live device (unit-tested only), and `./fleet add` driving a real remote device.
+- `./fleet remove --force` on a live device (unit-tested only), and `./fleet add` driving a real remote device (every Raspberry Pi run so far had the server and the device on the same Pi).
 - Agents resuming after a long outage of the stack (only about half a minute was tested).
 - A person following the README cold, without step-by-step help.
 - The alert returning to Normal on the Pi (seen only on x86).
-- Notifications reaching the real Discord, Slack or Telegram services, email, repeat messages after the 4-hour repeat interval, flapping devices, and `notify` on the Raspberry Pi.
+- **Notifications reaching a real phone:** ntfy.sh and its app, Discord, Slack and Telegram have never been tried for real (ntfy was checked against a stand-in server, run J). Also email, repeat messages after the 4-hour repeat interval, flapping devices, and `notify` on the Raspberry Pi.
 - Behaviour with more than a handful of devices, or long retention.
 - **Any real MQTT board.** ESP32, Pico W, Arduino and other hardware never touched this. The MicroPython and Arduino examples in `docs/MQTT.md` were not run or compiled; only the shell and Python examples were run.
-- The MQTT input on a Raspberry Pi (both images are published for arm64, but nothing was started there), building the bridge image on a Pi, and a broker that requires TLS or speaks only MQTT 5 (not supported).
+- A broker that requires TLS or speaks only MQTT 5 (not supported). The MQTT input did run on a Raspberry Pi 5 (run J).
 - The MQTT input under load: the 500-device and 64-metric limits and the 20,000-reading buffer are unit-tested, not stress-tested.
-- **The check-in URL from anything but `curl` on the server itself:** a router, `wget`, a microcontroller, a machine on another network. It was also not tried with IPv6 or behind a reverse proxy.
+- **The check-in URL from anything but `curl`:** a router, `wget`, a microcontroller, a machine on another network (on the Pi the owner ran the printed command; from where is not recorded). It was also not tried with IPv6 or behind a reverse proxy.
 - **The new README workflow followed by a person** on a fresh laptop or Pi, including Docker's installer script (not run here).
-- **`./fleet watch` against anything real:** a router, a NAS, a PLC port, an ESPHome board, a Klipper or Prusa exporter, a real `node_exporter`, or a Raspberry Pi. Only a container, VictoriaMetrics' own exporter and ESPHome-style sample text were used.
+- **`./fleet watch` against most real things:** a NAS, a PLC port, an ESPHome board, a Klipper or Prusa exporter, a real `node_exporter`. A router was pinged from a Raspberry Pi (run J); everything else used a container, VictoriaMetrics' own exporter and ESPHome-style sample text.
 - **https targets, `--insecure` and certificate errors:** no TLS server was available, so none of that was run. IPv6 targets were not run either, and `.local` names were not tried (the guide says they usually do not resolve inside Docker).
 - Last Will handling (not implemented: a board is OFFLINE by silence) and topics from Tasmota, ESPHome, Zigbee2MQTT or Home Assistant (not mapped).
-- `install-service.sh` on a Raspberry Pi or any real device, a real power cycle, systemd older than 247 (the `ProtectProc` option would be ignored with a warning; not tried), other distributions, and a device with no internet (the installer needs it once).
+- `install-service.sh` on any real device other than the Pi 5 (it ran there, run J), a real power cycle (never done), systemd older than 247 (the `ProtectProc` option would be ignored with a warning; not tried), other distributions, and a device with no internet (the installer needs it once).

@@ -9,7 +9,7 @@
   ./fleet add <id> [--mqtt|--checkin]   onboard a device: shows what to run on it, waits for it to appear
   ./fleet remove <id>         forget a retired device (deletes its stored data, asks first)
   ./fleet watch add|list|remove   watch things that cannot run the agent: a ping, a port, a web page, a metrics endpoint
-  ./fleet notify set|test|status|off   send alerts to Discord, Slack, Telegram or a webhook
+  ./fleet notify set|test|status|off   send alerts to ntfy, Telegram, Discord, Slack or a webhook
 
 Run it on the machine that hosts the stack. Needs Docker with Compose v2 and Python 3.9+, nothing else.
 Demonstration tool: no authentication or TLS anywhere (see README, Known limitations).
@@ -770,7 +770,36 @@ def bridge_status():
 NOTIFY_UID = "fleet-notify"
 NOTIFY_API = "/apis/notifications.alerting.grafana.app/v1beta1/namespaces/default"
 SAFE_ROOT_RECEIVERS = ("empty", "grafana-default-email", NOTIFY_UID)  # an untouched Grafana, or ours
+NTFY_SERVER = "https://ntfy.sh"
+NTFY_TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# ntfy has no Grafana contact-point type, but it accepts a JSON message posted to its root address. Grafana's webhook can
+# send a custom payload, so this template turns each alert into one: red alarm when a device goes quiet, a tick when it is back.
+NTFY_TEMPLATE = (
+    '{"topic":"@TOPIC@",'
+    '"title":"{{ if eq .Status "firing" }}Device offline{{ else }}Device back online{{ end }}",'
+    '"message":"{{ range .Alerts }}{{ if eq .Status "firing" }}{{ .Annotations.summary }}'
+    '{{ else }}{{ .Labels.device_id }} is reporting again{{ end }}\\n{{ end }}",'
+    '"priority":{{ if eq .Status "firing" }}4{{ else }}3{{ end }},'
+    '"tags":["{{ if eq .Status "firing" }}rotating_light{{ else }}white_check_mark{{ end }}"]}')
+
+
+def ntfy_settings(values):
+    """'mytopic' (on ntfy.sh) or 'https://your.server/mytopic' -> the Grafana webhook settings that publish to it."""
+    text, base, topic = values[0], NTFY_SERVER, values[0]
+    if "://" in text:
+        parts = urllib.parse.urlsplit(text)
+        if parts.scheme not in ("http", "https") or not parts.netloc or parts.query or parts.fragment:
+            raise FleetError("that does not look like an ntfy address: use a topic name, or https://your.server/topic")
+        head, _, topic = parts.path.rstrip("/").rpartition("/")
+        base = f"{parts.scheme}://{parts.netloc}{head}"
+    if not NTFY_TOPIC_RE.fullmatch(topic):
+        raise FleetError("an ntfy topic is 1 to 64 letters, digits, '-' and '_' (no spaces or dots)")
+    return {"url": base.rstrip("/") + "/", "httpMethod": "POST",
+            "payload": {"template": NTFY_TEMPLATE.replace("@TOPIC@", topic)}}
+
+
 NOTIFY_TYPES = {  # type -> (argument names, how they map to Grafana's settings)
+    "ntfy": (("topic",), ntfy_settings),
     "webhook": (("url",), lambda a: {"url": a[0]}),
     "discord": (("webhook-url",), lambda a: {"url": a[0]}),
     "slack": (("webhook-url",), lambda a: {"url": a[0]}),
@@ -821,7 +850,7 @@ def run_notify_test():
     """Ask Grafana to send a test through the saved contact point. Returns (ok, detail)."""
     rec = notify_receiver()
     if not rec:
-        raise FleetError("no notifications are set up. Run: ./fleet notify set <discord|slack|telegram|webhook> ...")
+        raise FleetError("no notifications are set up. Run: ./fleet notify set <ntfy|telegram|discord|slack|webhook> ...")
     integ = rec["spec"]["integrations"][0]
     body = {"integration": {k: integ[k] for k in ("uid", "type", "version", "settings", "secureFields") if k in integ}}
     status, res = grafana("POST", f"{NOTIFY_API}/receivers/{receiver_id(NOTIFY_UID)}/test", body)
@@ -852,6 +881,13 @@ def cmd_notify_set(args):
     require_stack()
     names, build = NOTIFY_TYPES[args.type]
     values = [v.strip() for v in args.values]
+    if args.random_topic and args.type != "ntfy":
+        raise FleetError("--random-topic only applies to ntfy")
+    random_topic = args.random_topic
+    if random_topic:
+        if values:
+            raise FleetError("--random-topic makes the topic name for you: leave the topic out")
+        values = [f"fleet-{secrets.token_hex(8)}"]
     if values and len(values) != len(names):
         raise FleetError(f"{args.type} needs: {' '.join(names)}")
     if not values:
@@ -870,8 +906,8 @@ def cmd_notify_set(args):
         raise FleetError("your Grafana notification policy has been customised, so it will not be overwritten. "
                          "Re-run with --force to replace it (Alerting > Notification policies shows what is there).")
     before = applied_config_id()
-    body = {"uid": NOTIFY_UID, "name": NOTIFY_UID, "type": args.type, "settings": build(values),
-            "disableResolveMessage": False}
+    body = {"uid": NOTIFY_UID, "name": NOTIFY_UID, "type": "webhook" if args.type == "ntfy" else args.type,
+            "settings": build(values), "disableResolveMessage": False}
     if notify_configured():
         status, res = grafana("PUT", f"/api/v1/provisioning/contact-points/{NOTIFY_UID}", body)
     else:
@@ -886,6 +922,14 @@ def cmd_notify_set(args):
                          f"{(res or {}).get('message', '')}")
     print(f"{tick()} Saved: alerts will go to {bold(args.type)}. "
           f"{dim('Each device alerts on its own; a recovery message follows.')}")
+    if args.type == "ntfy":
+        topic = values[0].rstrip("/").rpartition("/")[2]
+        if random_topic:
+            print(f"  Your topic is {bold(topic)}: in the ntfy app, subscribe to it (+, then the topic name"
+                  f"{'' if '://' in values[0] else ', on the default server ntfy.sh'}). It is not shown again by ./fleet.")
+        if "://" not in values[0]:
+            print(dim("  On ntfy.sh anyone who knows the topic name can read your alerts, so use a long one nobody would guess "
+                      "(--random-topic makes one)."))
     ok, detail = run_notify_test()
     if ok:
         print(f"{tick()} Test message accepted by the destination {dim('(' + detail + '). Check that it arrived.')}")
@@ -920,13 +964,14 @@ def cmd_notify_status(args):
     rec = notify_receiver()
     if not rec:
         print("Notifications: off. Alerts are visible in Grafana only.")
-        print("  Turn them on:  ./fleet notify set <discord|slack|telegram|webhook> ...")
+        print("  Turn them on:  ./fleet notify set <ntfy|telegram|discord|slack|webhook> ...")
         return 0
     integ = rec["spec"]["integrations"][0]
     _, policy = grafana("GET", "/api/v1/provisioning/policies")
     routed = (policy or {}).get("receiver") == NOTIFY_UID
     where = public_address(integ.get("settings")) or "address stored encrypted by Grafana"
-    print(f"Notifications: {bold(integ['type'])} {dim('(' + where + ')')}")
+    shown = "ntfy" if '"topic"' in ((integ.get("settings") or {}).get("payload") or {}).get("template", "") else integ["type"]
+    print(f"Notifications: {bold(shown)} {dim('(' + where + ')')}")
     print(f"  Routing      {'all alerts go to it' if routed else yellow('NOT routed: another notification policy is active')}")
     status, receivers = grafana("GET", "/api/alertmanager/grafana/config/api/v1/receivers")
     mine = next((r for r in (receivers or []) if r.get("name") == NOTIFY_UID), None)
@@ -1036,7 +1081,7 @@ def cmd_up(args):
     else:
         print(f"  {n} device(s) already known.   ./fleet list")
     if notify_configured() is False:
-        print("  Alerts show in Grafana only.    ./fleet notify set discord|slack|telegram|webhook")
+        print("  Alerts show in Grafana only.    ./fleet notify set ntfy|telegram|discord|slack|webhook")
     print("  Stop everything with:           ./fleet down")
 
 
@@ -1335,6 +1380,15 @@ def cmd_remove(args):
 
 
 # ---------------------------------------------------------------- CLI
+def kind_arg(value):
+    if value not in ("ping", "tcp", "http", "metrics"):
+        forgot = any(c in value for c in ".:/") or value.isdigit()  # an address where the kind should be
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a kind: choose ping, tcp, http or metrics. The form is: ./fleet watch add <name> <kind> <address>."
+            + (f" It looks like the kind was left out, for example: ./fleet watch add router ping {value}" if forgot else ""))
+    return value
+
+
 def device_id_arg(value):
     if not is_valid_device_id(value):
         raise argparse.ArgumentTypeError(
@@ -1399,7 +1453,7 @@ def build_parser():
                         description="Kinds: ping HOST | tcp HOST:PORT | http URL | metrics URL (a Prometheus /metrics page, "
                                     "for example ESPHome's or an exporter's: its numbers are stored too).")
     s.add_argument("device_id", metavar="id", type=device_id_arg)
-    s.add_argument("kind", choices=["ping", "tcp", "http", "metrics"])
+    s.add_argument("kind", type=kind_arg, metavar="{ping,tcp,http,metrics}")
     s.add_argument("target", help="host (ping), host:port (tcp) or an http(s):// address (http, metrics)")
     s.add_argument("--interval", type=float, metavar="SECONDS", help="how often to check (default 15, 5 to 3600)")
     s.add_argument("--timeout", type=float, metavar="SECONDS", help="how long to wait for an answer (default 5)")
@@ -1418,14 +1472,15 @@ def build_parser():
     s.set_defaults(func=cmd_watch_remove)
     wp.set_defaults(func=lambda a: wp.print_help() or 0)
 
-    n = sub.add_parser("notify", help="send alerts to Discord, Slack, Telegram or a webhook")
+    n = sub.add_parser("notify", help="send alerts to ntfy, Telegram, Discord, Slack or a webhook")
     nsub = n.add_subparsers(dest="notify_cmd", metavar="<action>")
     s = nsub.add_parser("set", help="choose where alerts go (the address or token goes straight into Grafana)")
     s.add_argument("type", choices=sorted(NOTIFY_TYPES), help="where to send alerts")
     s.add_argument("values", nargs="*", metavar="value",
-                   help="webhook URL (discord, slack, webhook) or '<bot-token> <chat-id>' (telegram); "
-                        "leave out to be asked, with the input hidden")
+                   help="a topic name or https://your.server/topic (ntfy), a webhook URL (discord, slack, webhook) or "
+                        "'<bot-token> <chat-id>' (telegram); leave out to be asked, with the input hidden")
     s.add_argument("--force", action="store_true", help="replace a notification policy you customised in Grafana")
+    s.add_argument("--random-topic", action="store_true", help="ntfy only: make a long random topic name for you (and say what it is)")
     s.add_argument("--no-wait", action="store_true", help="do not wait (about a minute) for Grafana to switch over")
     s.set_defaults(func=cmd_notify_set)
     s = nsub.add_parser("test", help="send a test message through the saved destination")

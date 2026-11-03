@@ -169,4 +169,5 @@ docker compose logs mqtt-bridge
 - **Our topic scheme only.** Devices that already publish their own topics (Tasmota, ESPHome, Zigbee2MQTT, Home
   Assistant) are not mapped yet; they would need a mapping layer.
 - **Real boards are untested.** Everything was validated with simulated devices (`scripts/validate_mqtt.sh`), a real
-  Mosquitto and the real stack. No ESP32, Pico or Arduino was available.
+  Mosquitto and the real stack. The broker and bridge also built and ran on a Raspberry Pi 5 (arm64), with a simulated board
+  sent by `mosquitto_pub`. No ESP32, Pico or Arduino was available.

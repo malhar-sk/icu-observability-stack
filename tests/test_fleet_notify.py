@@ -75,7 +75,8 @@ class FakeGrafana(BaseHTTPRequestHandler):
                 return self._send(404, {"message": "not found"})
             secret_url = c["type"] != "webhook"  # Grafana hides these when reading back
             integ = {"uid": c["uid"], "type": c["type"], "version": "v1",
-                     "settings": {} if secret_url or c["type"] == "telegram" else {"url": c["settings"]["url"]},
+                     "settings": {} if secret_url or c["type"] == "telegram" else
+                     {"url": c["settings"]["url"], **({"payload": c["settings"]["payload"]} if "payload" in c["settings"] else {})},
                      "secureFields": {k: True for k in c["settings"]} if secret_url else {}}
             return self._send(200, {"spec": {"title": c["name"], "integrations": [integ]}})
         if path == f"{fleet.NOTIFY_API}/receivers/{RECEIVER}/test" and method == "POST":

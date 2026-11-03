@@ -91,5 +91,5 @@ never contains the key.
 - Turn the service off with `./fleet up --no-checkin`. The key stays in `.env`, so the commands you already gave to devices
   work again if you turn it back on.
 - Limits: 500 devices, 64 readings per request, addresses up to 2000 characters. IPv6 was not tried.
-- **Not tested on real hardware:** only `curl` against the container, from the same machine. Routers, busybox `wget` and
-  boards that call the URL themselves were not tried.
+- **Tested with `curl` only:** against the container on x86, and the printed command on a Raspberry Pi 5, where the device
+  appeared. Routers, busybox `wget` and boards that call the URL themselves were not tried.

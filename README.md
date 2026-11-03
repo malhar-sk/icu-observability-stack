@@ -185,9 +185,18 @@ then open **Alerting, Alert rules, Device Fleet, DeviceOffline** in Grafana.
 
 ### 6. Get alerts on your phone (optional)
 
-Out of the box an offline device only shows up if you open Grafana. To get a message instead:
+Out of the box an offline device only shows up if you open Grafana. To get a message instead, the easiest way is
+**ntfy**: no account and no bot to set up.
+
+1. Install the **ntfy** app on your phone (Android or iPhone, from the usual app store).
+2. On the server run `./fleet notify set ntfy --random-topic`. It makes a long topic name nobody would guess (on the
+   public ntfy.sh server, anyone who knows a topic name can read it) and tells you what it is, once.
+3. In the app, press **+** and subscribe to that topic.
+
+That is all. The other options need a bit more setup (a Telegram bot, or a webhook address from Discord or Slack):
 
 ```bash
+./fleet notify set ntfy my-own-topic-name    # or your own ntfy server: ./fleet notify set ntfy https://ntfy.example.org/topic
 ./fleet notify set discord                   # asks for the webhook URL, with the input hidden
 ./fleet notify set slack https://hooks.slack.com/services/...
 ./fleet notify set telegram <bot-token> <chat-id>
@@ -203,9 +212,11 @@ until Grafana has switched over (up to about a minute: it applies alerting chang
 ./fleet notify off       # stop sending (alerts stay visible in Grafana)
 ```
 
-You get one message per device when it goes offline and one when it is back. **What was tested:** a real alert delivered to a
-webhook end to end; the Slack and Discord formats against a local listener only; Telegram could not be reached from the
-test machine. Email is not covered. See [docs/VALIDATION.md](docs/VALIDATION.md), Run E.
+You get one message per device when it goes offline and one when it is back. **What was tested:** real Grafana alerts
+(a device going quiet, then back) delivered end to end to a webhook, and in ntfy's own message format to a stand-in ntfy
+server; the Slack and Discord formats against a local listener only. **Not yet:** the real ntfy.sh and the phone app
+(the test machine could not reach them) and Telegram. Email is not covered. See [docs/VALIDATION.md](docs/VALIDATION.md),
+Runs E and J.
 
 ### 7. Day to day
 
@@ -424,15 +435,15 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 
 - **No authentication or TLS** anywhere: agents send plaintext gRPC and anyone who can reach port 4317 can inject data. Grafana uses `admin` / `admin`.
 - **No device registry.** A device that has never reported is invisible, and a device silent for more than a day drops off the dashboard. That is why `./fleet add` cannot "create" a device on the server: a device exists once it reports.
-- **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there; on a device, `agent/install-service.sh` makes the agent start at boot (systemd only). Both `./fleet` and the installer were tested on x86_64 Linux; neither has been run on the Raspberry Pi.
-- **Notifications are opt-in.** Until you run `./fleet notify set ...`, an alert is visible only inside Grafana (and its API). `fleet notify` covers Discord, Slack, Telegram and webhooks, not email, and only the webhook path was tested end to end.
+- **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there; on a device, `agent/install-service.sh` makes the agent start at boot (systemd only). `./fleet` and the installer were tested on x86_64 Linux, and the owner ran them on a Raspberry Pi 5 (see below).
+- **Notifications are opt-in.** Until you run `./fleet notify set ...`, an alert is visible only inside Grafana (and its API). `fleet notify` covers ntfy, Telegram, Discord, Slack and webhooks, not email. Only the webhook path (and ntfy, against a stand-in server) was tested end to end; nothing has reached a real phone yet.
 - **Offline detection is not instant.** With the default agent it takes about a minute from the device stopping to the alert firing; a device that reports every N seconds is OFFLINE after 3N (at least 30 s), and the alert follows 30 s later.
 - **Watching is from the server's side only.** The watcher sees what its container sees, cannot send a login or token, and for a watched target "uptime" means time answering continuously, not time since boot. A target that has never answered is invisible, like any device. Tested against real containers and a real exporter (VictoriaMetrics' own `/metrics`) and ESPHome-style sample output; **no real ESPHome board, router or PLC was available**. See [docs/WATCH.md](docs/WATCH.md).
-- **The check-in URL is plain HTTP with one shared key.** Anyone on your network who has the key can report as any device. A device can check in at most every 5 s and at slowest every 8 h (the dashboard looks back one day). Tested with `curl` against the container from the same machine; routers, `wget` and boards calling the URL themselves were not tried. See [docs/CHECKIN.md](docs/CHECKIN.md).
-- **MQTT is plain and shared.** No TLS, one shared password for all boards, our `fleet/<device_id>/<metric>` topic scheme only (Tasmota, ESPHome, Zigbee2MQTT and Home Assistant topics are not mapped), and no Last Will handling: a board is OFFLINE by silence. Tested with simulated devices and a real broker; **no real ESP32, Pico or Arduino was available**. See [docs/MQTT.md](docs/MQTT.md).
+- **The check-in URL is plain HTTP with one shared key.** Anyone on your network who has the key can report as any device. A device can check in at most every 5 s and at slowest every 8 h (the dashboard looks back one day). Tested with `curl` against the container on x86, and the owner ran the printed command on a Raspberry Pi 5 and the device appeared; routers, `wget` and boards calling the URL themselves were not tried. See [docs/CHECKIN.md](docs/CHECKIN.md).
+- **MQTT is plain and shared.** No TLS, one shared password for all boards, our `fleet/<device_id>/<metric>` topic scheme only (Tasmota, ESPHome, Zigbee2MQTT and Home Assistant topics are not mapped), and no Last Will handling: a board is OFFLINE by silence. Tested with simulated devices and a real broker, on x86 and on a Raspberry Pi 5 (the bridge built and ran on arm64); **no real ESP32, Pico or Arduino was available**. See [docs/MQTT.md](docs/MQTT.md).
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
 - **Single node, demo scale.** One VictoriaMetrics, one Collector, one Grafana, no redundancy or retention tuning.
-- **Verified on x86_64 Linux and on one Raspberry Pi 5** (aarch64, Debian 13 "trixie"), where the stack and both demo agents ran on the same Pi and the dashboard was viewed from a laptop. **Not yet verified:** a separate device pushing to the server over the network, 32-bit Raspberry Pi OS, Pi Zero-class hardware, and real ESP32-class boards (the agent is Linux-only; they use the MQTT input, tested only with simulated devices). See [docs/VALIDATION.md](docs/VALIDATION.md).
+- **Verified on x86_64 Linux and on one Raspberry Pi 5** (aarch64, Debian 13 "trixie"), where the stack and both demo agents ran on the same Pi and the dashboard was viewed from a laptop. Later, run by the Pi's owner on the same Pi: the agent installed as a service, a check-in URL device, a ping-watched router, and the MQTT broker and bridge with a simulated board. **Not yet verified:** a separate device pushing to the server over the network, 32-bit Raspberry Pi OS, Pi Zero-class hardware, and real ESP32-class boards (the agent is Linux-only; they use the MQTT input, tested only with simulated devices). See [docs/VALIDATION.md](docs/VALIDATION.md).
 - **Demonstration only.** Not production-ready and not suitable for clinical or medical-device use.
 
 ---
