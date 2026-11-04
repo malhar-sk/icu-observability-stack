@@ -1,6 +1,7 @@
 services:
   victoriametrics:
     image: victoriametrics/victoria-metrics:v1.155.0
+    restart: unless-stopped  # the server must come back by itself after a power cut (it stays down only if you stopped it)
     command:
       # Persist data in the mounted volume (the image default path is not /storage).
       - "-storageDataPath=/storage"
@@ -13,9 +14,13 @@ services:
 
   grafana:
     image: grafana/grafana:13.3.0
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
+      # The admin password, used only when Grafana creates its database for the first time. `./fleet up` puts a random
+      # one in .env on a first install; without it, Grafana's built-in default (admin) applies.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       # Open the fleet dashboard on login.
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/device-fleet.json
     volumes:
@@ -25,6 +30,7 @@ services:
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.164.0
+    restart: unless-stopped
     volumes:
       - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml
     ports:

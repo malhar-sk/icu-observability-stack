@@ -15,14 +15,17 @@
 # Never runs `docker compose down -v`. The simulated boards (test-m-*) are removed at the end unless --keep is given.
 #
 # Environment overrides (defaults in brackets): VM_URL [http://localhost:8428]  GRAFANA_URL [http://localhost:3000]
-#   GRAFANA_AUTH [admin:admin]
+#   GRAFANA_AUTH [admin:<the password in .env, else admin>]
 
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VM_URL="${VM_URL:-http://localhost:8428}"
 GRAFANA_URL="${GRAFANA_URL:-http://localhost:3000}"
-GRAFANA_AUTH="${GRAFANA_AUTH:-admin:admin}"
+# Grafana's login: GRAFANA_AUTH if given, else the password ./fleet keeps in .env, else Grafana's default.
+grafana_pw() { local p; p=$(sed -n 's/^GRAFANA_ADMIN_PASSWORD=//p' "$ROOT/.env" 2>/dev/null | head -1 | tr -d "'"); echo "${p:-admin}"; }
+USER_AUTH="${GRAFANA_AUTH:-}"; GRAFANA_AUTH="${USER_AUTH:-admin:$(grafana_pw)}"
+refresh_auth() { [ -n "$USER_AUTH" ] || GRAFANA_AUTH="admin:$(grafana_pw)"; }  # a first `./fleet up` creates the password
 KEEP=0
 case "${1-}" in
   --keep) KEEP=1 ;;
@@ -114,7 +117,7 @@ cd "$ROOT" || exit 2
 printf 'MQTT end-to-end check (about 4 minutes)\n\n'
 
 # ---- 1. the stack, with MQTT
-if fleet up --mqtt >/tmp/validate_mqtt_up.log 2>&1; then pass "./fleet up --mqtt" "stack and MQTT input are up"; else fail "./fleet up --mqtt" "see /tmp/validate_mqtt_up.log"; cat /tmp/validate_mqtt_up.log; exit 1; fi
+if fleet up --mqtt >/tmp/validate_mqtt_up.log 2>&1; then refresh_auth; pass "./fleet up --mqtt" "stack and MQTT input are up"; else fail "./fleet up --mqtt" "see /tmp/validate_mqtt_up.log"; cat /tmp/validate_mqtt_up.log; exit 1; fi
 PW=$(sed -n 's/^MQTT_PASSWORD=//p' .env)
 [ -n "$PW" ] || { fail "password in .env" "missing"; exit 1; }
 status=$(fleet status 2>&1)

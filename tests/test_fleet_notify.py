@@ -46,6 +46,12 @@ class FakeGrafana(BaseHTTPRequestHandler):
             return self._send(401, {"message": "Unauthorized"})
         body = self._body() if method in ("POST", "PUT") else None
         st["calls"].append((method, path, body))
+        st.setdefault("auth_seen", []).append(self.headers.get("Authorization"))
+        if path == "/api/user/password" and method == "PUT":  # like Grafana: the old password must be right
+            if body.get("oldPassword") != st.get("password", "admin"):
+                return self._send(400, {"message": "Invalid old password"})
+            st["password"] = body["newPassword"]
+            return self._send(200, {"message": "User password changed"})
         if method in ("POST", "PUT", "DELETE") and not path.endswith("/test"):
             st["dirty"], st["polls_since_write"] = True, 0
         cp = "/api/v1/provisioning/contact-points"
@@ -75,7 +81,8 @@ class FakeGrafana(BaseHTTPRequestHandler):
                 return self._send(404, {"message": "not found"})
             secret_url = c["type"] != "webhook"  # Grafana hides these when reading back
             integ = {"uid": c["uid"], "type": c["type"], "version": "v1",
-                     "settings": {} if secret_url or c["type"] == "telegram" else {"url": c["settings"]["url"]},
+                     "settings": {} if secret_url or c["type"] == "telegram" else
+                     {"url": c["settings"]["url"], **({"payload": c["settings"]["payload"]} if "payload" in c["settings"] else {})},
                      "secureFields": {k: True for k in c["settings"]} if secret_url else {}}
             return self._send(200, {"spec": {"title": c["name"], "integrations": [integ]}})
         if path == f"{fleet.NOTIFY_API}/receivers/{RECEIVER}/test" and method == "POST":
@@ -124,7 +131,7 @@ class WithFakeGrafana(WithFakeVM):
                              "test_status": "success", "test_error": "", "running_type": None,
                              "attempt": {"lastNotifyAttempt": "0001-01-01T00:00:00.000Z"},
                              "history_polls": 0, "bump_after": 0, "history_id": 10, "dirty": False,
-                             "polls_since_write": 0}
+                             "polls_since_write": 0, "password": "admin"}
         for target, value in (("GRAFANA_URL", self.gurl), ("GRAFANA_AUTH", "admin:admin")):
             p = mock.patch.object(fleet, target, value)
             p.start()

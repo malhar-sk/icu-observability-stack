@@ -122,7 +122,7 @@ class AddTests(WithWatch):
         self.assertIn("OFFLINE after 30s", out)
 
     def test_bad_input_is_refused_before_anything_changes(self):
-        for argv, text in [(("Router", "ping", "x"), "invalid device id"), (("r", "udp", "x"), "invalid choice"),
+        for argv, text in [(("Router", "ping", "x"), "invalid device id"), (("r", "udp", "x"), "is not a kind"),
                            (("r", "tcp", "host"), "host:port"),
                            (("r", "http", "ftp://x"), "http:// or https://"), (("r", "ping", "x", "--interval", "1"), "between 5 and 3600"),
                            (("r", "ping", "x", "--insecure"), "only apply to http"), (("r", "http", "http://x/", "--insecure"), "https"),
@@ -133,6 +133,18 @@ class AddTests(WithWatch):
         self.assertEqual(self.targets(), [])
         self.assertEqual(self.docker_calls(), [])
         self.assertFalse(os.path.exists(self.env_path))
+
+    def test_leaving_out_the_kind_says_what_the_command_looks_like(self):
+        code, _, err = run(["watch", "add", "router", "10.0.0.1"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("is not a kind", err)
+        self.assertIn("./fleet watch add router ping 10.0.0.1", err)  # the fix, with their own address filled in
+        for address in ("nas.lan", "192.168.1.5", "host:80", "http://x/", "5"):
+            self.assertIn("looks like the kind was left out", run(["watch", "add", "r", address])[2], address)
+        code, _, err = run(["watch", "add", "r", "udp", "x"])  # a wrong kind is not an address: no misleading example
+        self.assertIn("choose ping, tcp, http or metrics", err)
+        self.assertNotIn("left out", err)
+        self.assertNotIn("ping udp", err)
 
     def test_a_target_that_looks_like_an_option_cannot_reach_ping(self):
         # argparse refuses it outright; and if it is forced through with `--`, the validation does

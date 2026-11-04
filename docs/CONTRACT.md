@@ -191,7 +191,7 @@ A device that has never checked in is invisible (the same rule as for every devi
 Mounts (already in `docker-compose.yml`):
 `./grafana/provisioning` to `/etc/grafana/provisioning` (read-only) and
 `./grafana/dashboards` to `/var/lib/grafana/dashboards` (read-only).
-Grafana login is the default `admin` / `admin`.
+Grafana's admin password is set only when Grafana first creates its database: from `GRAFANA_ADMIN_PASSWORD` in `.env` (`./fleet up` writes a random one there on a first install; `./fleet password` changes it), else Grafana's `admin`. `./fleet` reads the password from `.env` for its own Grafana calls.
 
 ## File ownership (no overlaps)
 

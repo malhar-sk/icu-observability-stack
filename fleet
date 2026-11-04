@@ -9,7 +9,8 @@
   ./fleet add <id> [--mqtt|--checkin]   onboard a device: shows what to run on it, waits for it to appear
   ./fleet remove <id>         forget a retired device (deletes its stored data, asks first)
   ./fleet watch add|list|remove   watch things that cannot run the agent: a ping, a port, a web page, a metrics endpoint
-  ./fleet notify set|test|status|off   send alerts to Discord, Slack, Telegram or a webhook
+  ./fleet notify set|test|status|off   send alerts to ntfy, Telegram, Discord, Slack or a webhook
+  ./fleet password [--ask|--show]      change the Grafana admin password (a random one by default), or show it
 
 Run it on the machine that hosts the stack. Needs Docker with Compose v2 and Python 3.9+, nothing else.
 Demonstration tool: no authentication or TLS anywhere (see README, Known limitations).
@@ -39,7 +40,7 @@ from device_agent import DEVICE_ID_RE, is_valid_device_id  # noqa: E402  one sou
 
 VM_URL = os.environ.get("FLEET_VM_URL", "http://localhost:8428").rstrip("/")
 GRAFANA_URL = os.environ.get("FLEET_GRAFANA_URL", "http://localhost:3000").rstrip("/")
-GRAFANA_AUTH = os.environ.get("FLEET_GRAFANA_AUTH", "admin:admin")
+GRAFANA_AUTH = os.environ.get("FLEET_GRAFANA_AUTH")  # "user:password"; when unset, grafana_auth() uses the password kept in .env
 OTLP_PORT = 4317
 MQTT_PORT = 1883
 ENV_FILE = os.path.join(ROOT, ".env")  # holds the MQTT settings; gitignored because the password is a secret
@@ -170,9 +171,14 @@ def port_open(host, port, timeout=2):
         return False
 
 
+def grafana_auth():
+    """'admin:<password>' for Grafana's API: an explicit FLEET_GRAFANA_AUTH, else the password kept in .env, else the default."""
+    return GRAFANA_AUTH or "admin:" + (read_env().get("GRAFANA_ADMIN_PASSWORD") or "admin")
+
+
 def dashboard_state():
     try:
-        status, _ = http("GET", GRAFANA_URL + "/api/dashboards/uid/device-fleet", auth=GRAFANA_AUTH, timeout=5)
+        status, _ = http("GET", GRAFANA_URL + "/api/dashboards/uid/device-fleet", auth=grafana_auth(), timeout=5)
     except FleetError:
         return "unreachable"
     return {200: "ok", 401: "login", 403: "login", 404: "missing"}.get(status, f"http {status}")
@@ -770,7 +776,36 @@ def bridge_status():
 NOTIFY_UID = "fleet-notify"
 NOTIFY_API = "/apis/notifications.alerting.grafana.app/v1beta1/namespaces/default"
 SAFE_ROOT_RECEIVERS = ("empty", "grafana-default-email", NOTIFY_UID)  # an untouched Grafana, or ours
+NTFY_SERVER = "https://ntfy.sh"
+NTFY_TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# ntfy has no Grafana contact-point type, but it accepts a JSON message posted to its root address. Grafana's webhook can
+# send a custom payload, so this template turns each alert into one: red alarm when a device goes quiet, a tick when it is back.
+NTFY_TEMPLATE = (
+    '{"topic":"@TOPIC@",'
+    '"title":"{{ if eq .Status "firing" }}Device offline{{ else }}Device back online{{ end }}",'
+    '"message":"{{ range .Alerts }}{{ if eq .Status "firing" }}{{ .Annotations.summary }}'
+    '{{ else }}{{ .Labels.device_id }} is reporting again{{ end }}\\n{{ end }}",'
+    '"priority":{{ if eq .Status "firing" }}4{{ else }}3{{ end }},'
+    '"tags":["{{ if eq .Status "firing" }}rotating_light{{ else }}white_check_mark{{ end }}"]}')
+
+
+def ntfy_settings(values):
+    """'mytopic' (on ntfy.sh) or 'https://your.server/mytopic' -> the Grafana webhook settings that publish to it."""
+    text, base, topic = values[0], NTFY_SERVER, values[0]
+    if "://" in text:
+        parts = urllib.parse.urlsplit(text)
+        if parts.scheme not in ("http", "https") or not parts.netloc or parts.query or parts.fragment:
+            raise FleetError("that does not look like an ntfy address: use a topic name, or https://your.server/topic")
+        head, _, topic = parts.path.rstrip("/").rpartition("/")
+        base = f"{parts.scheme}://{parts.netloc}{head}"
+    if not NTFY_TOPIC_RE.fullmatch(topic):
+        raise FleetError("an ntfy topic is 1 to 64 letters, digits, '-' and '_' (no spaces or dots)")
+    return {"url": base.rstrip("/") + "/", "httpMethod": "POST",
+            "payload": {"template": NTFY_TEMPLATE.replace("@TOPIC@", topic)}}
+
+
 NOTIFY_TYPES = {  # type -> (argument names, how they map to Grafana's settings)
+    "ntfy": (("topic",), ntfy_settings),
     "webhook": (("url",), lambda a: {"url": a[0]}),
     "discord": (("webhook-url",), lambda a: {"url": a[0]}),
     "slack": (("webhook-url",), lambda a: {"url": a[0]}),
@@ -782,11 +817,11 @@ NEVER = "0001-01-01"  # Grafana's "no attempt yet" timestamp prefix
 def grafana(method, path, body=None):
     """Call Grafana's API. Returns (status, parsed JSON or None); raises with advice if the login is wrong."""
     data = json.dumps(body).encode() if body is not None else None
-    status, raw = http(method, GRAFANA_URL + path, data=data, auth=GRAFANA_AUTH, timeout=15,
+    status, raw = http(method, GRAFANA_URL + path, data=data, auth=grafana_auth(), timeout=15,
                        headers={"Content-Type": "application/json", "X-Disable-Provenance": "true"})
     if status in (401, 403):
-        raise FleetError("Grafana refused the login (default admin / admin). If you changed the password, run with "
-                         "FLEET_GRAFANA_AUTH=admin:<your password>")
+        raise FleetError("Grafana refused the login. If you changed the admin password in Grafana yourself, tell ./fleet: put "
+                         "GRAFANA_ADMIN_PASSWORD=<your password> in .env (or run with FLEET_GRAFANA_AUTH=admin:<your password>)")
     try:
         return status, (json.loads(raw) if raw else None)
     except ValueError:
@@ -821,7 +856,7 @@ def run_notify_test():
     """Ask Grafana to send a test through the saved contact point. Returns (ok, detail)."""
     rec = notify_receiver()
     if not rec:
-        raise FleetError("no notifications are set up. Run: ./fleet notify set <discord|slack|telegram|webhook> ...")
+        raise FleetError("no notifications are set up. Run: ./fleet notify set <ntfy|telegram|discord|slack|webhook> ...")
     integ = rec["spec"]["integrations"][0]
     body = {"integration": {k: integ[k] for k in ("uid", "type", "version", "settings", "secureFields") if k in integ}}
     status, res = grafana("POST", f"{NOTIFY_API}/receivers/{receiver_id(NOTIFY_UID)}/test", body)
@@ -852,6 +887,13 @@ def cmd_notify_set(args):
     require_stack()
     names, build = NOTIFY_TYPES[args.type]
     values = [v.strip() for v in args.values]
+    if args.random_topic and args.type != "ntfy":
+        raise FleetError("--random-topic only applies to ntfy")
+    random_topic = args.random_topic
+    if random_topic:
+        if values:
+            raise FleetError("--random-topic makes the topic name for you: leave the topic out")
+        values = [f"fleet-{secrets.token_hex(8)}"]
     if values and len(values) != len(names):
         raise FleetError(f"{args.type} needs: {' '.join(names)}")
     if not values:
@@ -870,8 +912,8 @@ def cmd_notify_set(args):
         raise FleetError("your Grafana notification policy has been customised, so it will not be overwritten. "
                          "Re-run with --force to replace it (Alerting > Notification policies shows what is there).")
     before = applied_config_id()
-    body = {"uid": NOTIFY_UID, "name": NOTIFY_UID, "type": args.type, "settings": build(values),
-            "disableResolveMessage": False}
+    body = {"uid": NOTIFY_UID, "name": NOTIFY_UID, "type": "webhook" if args.type == "ntfy" else args.type,
+            "settings": build(values), "disableResolveMessage": False}
     if notify_configured():
         status, res = grafana("PUT", f"/api/v1/provisioning/contact-points/{NOTIFY_UID}", body)
     else:
@@ -886,6 +928,14 @@ def cmd_notify_set(args):
                          f"{(res or {}).get('message', '')}")
     print(f"{tick()} Saved: alerts will go to {bold(args.type)}. "
           f"{dim('Each device alerts on its own; a recovery message follows.')}")
+    if args.type == "ntfy":
+        topic = values[0].rstrip("/").rpartition("/")[2]
+        if random_topic:
+            print(f"  Your topic is {bold(topic)}: in the ntfy app, subscribe to it (+, then the topic name"
+                  f"{'' if '://' in values[0] else ', on the default server ntfy.sh'}). It is not shown again by ./fleet.")
+        if "://" not in values[0]:
+            print(dim("  On ntfy.sh anyone who knows the topic name can read your alerts, so use a long one nobody would guess "
+                      "(--random-topic makes one)."))
     ok, detail = run_notify_test()
     if ok:
         print(f"{tick()} Test message accepted by the destination {dim('(' + detail + '). Check that it arrived.')}")
@@ -920,13 +970,14 @@ def cmd_notify_status(args):
     rec = notify_receiver()
     if not rec:
         print("Notifications: off. Alerts are visible in Grafana only.")
-        print("  Turn them on:  ./fleet notify set <discord|slack|telegram|webhook> ...")
+        print("  Turn them on:  ./fleet notify set <ntfy|telegram|discord|slack|webhook> ...")
         return 0
     integ = rec["spec"]["integrations"][0]
     _, policy = grafana("GET", "/api/v1/provisioning/policies")
     routed = (policy or {}).get("receiver") == NOTIFY_UID
     where = public_address(integ.get("settings")) or "address stored encrypted by Grafana"
-    print(f"Notifications: {bold(integ['type'])} {dim('(' + where + ')')}")
+    shown = "ntfy" if '"topic"' in ((integ.get("settings") or {}).get("payload") or {}).get("template", "") else integ["type"]
+    print(f"Notifications: {bold(shown)} {dim('(' + where + ')')}")
     print(f"  Routing      {'all alerts go to it' if routed else yellow('NOT routed: another notification policy is active')}")
     status, receivers = grafana("GET", "/api/alertmanager/grafana/config/api/v1/receivers")
     mine = next((r for r in (receivers or []) if r.get("name") == NOTIFY_UID), None)
@@ -965,6 +1016,19 @@ def cmd_notify_off(args):
 
 
 # ---------------------------------------------------------------- commands
+def prepare_grafana_password():
+    """First install only: give Grafana a random admin password (kept in .env) instead of the well-known default.
+    Returns it when it was just made. An existing Grafana already has a password, so it is left alone."""
+    if read_env().get("GRAFANA_ADMIN_PASSWORD"):
+        return None
+    r = subprocess.run(["docker", "volume", "ls", "-q"], capture_output=True, text=True)
+    if r.returncode or any(v == "grafana_data" or v.endswith("_grafana_data") for v in r.stdout.split()):
+        return None  # cannot tell, or Grafana already exists with a password of its own: change nothing
+    password = secrets.token_hex(12)
+    write_env({"GRAFANA_ADMIN_PASSWORD": password})
+    return password
+
+
 def cmd_up(args):
     require_docker()
     if args.mqtt or (mqtt_mode() == "bundled" and not (args.mqtt_broker or args.no_mqtt)):
@@ -981,6 +1045,7 @@ def cmd_up(args):
     if mode and subprocess.run(["docker", "image", "inspect", BRIDGE_IMAGE], capture_output=True).returncode:
         print("First MQTT run: building the bridge (downloads a small Python image, about 70 MB).")
         print(dim("  This needs internet access once."))
+    new_password = prepare_grafana_password()  # after the checks above: a refused `up` must change nothing
     started = time.time()
     if args.no_checkin:
         stop_checkin()
@@ -1014,8 +1079,12 @@ def cmd_up(args):
     print(f"{tick()} {bold('Stack is up')} {dim('(%ds)' % (time.time() - started))}")
     print()
     print(f"  Dashboard   http://localhost:3000" + (f"   (from other machines: http://{ip}:3000)" if ip else ""))
-    if login == "ok":
-        print(f"  Login       admin / admin   {dim('(Grafana may ask for a new password: you can skip it)')}")
+    if new_password:
+        print(f"  Login       admin / {bold(new_password)}   {dim('(made for you and kept in .env: ./fleet password --show)')}")
+    elif read_env().get("GRAFANA_ADMIN_PASSWORD"):
+        print(f"  Login       admin / the password in .env   {dim('(./fleet password --show prints it)')}")
+    elif login == "ok":
+        print(f"  Login       admin / admin   {yellow('the well-known default: change it with ./fleet password')}")
     elif login == "login":
         print("  Login       admin / the password you set")
     print(f"  Devices report to   {(ip or 'localhost')}:{OTLP_PORT}")
@@ -1036,8 +1105,37 @@ def cmd_up(args):
     else:
         print(f"  {n} device(s) already known.   ./fleet list")
     if notify_configured() is False:
-        print("  Alerts show in Grafana only.    ./fleet notify set discord|slack|telegram|webhook")
+        print("  Alerts show in Grafana only.    ./fleet notify set ntfy|telegram|discord|slack|webhook")
     print("  Stop everything with:           ./fleet down")
+
+
+def cmd_password(args):
+    env = read_env()
+    if args.show:
+        print(env.get("GRAFANA_ADMIN_PASSWORD") or "admin   (Grafana's default: ./fleet has not set one. Change it with ./fleet password)")
+        return 0
+    require_stack()
+    if args.ask:
+        if not sys.stdin.isatty():
+            raise FleetError("--ask needs a terminal (without it, ./fleet password makes a random one)")
+        new = getpass.getpass("New Grafana admin password (input is hidden): ")
+        if getpass.getpass("Again: ") != new:
+            raise FleetError("the two passwords differ; nothing was changed")
+        if len(new) < 8:
+            raise FleetError("use at least 8 characters; nothing was changed")
+    else:
+        new = secrets.token_hex(12)
+    env_quote(new)  # refuse a password .env cannot hold BEFORE touching Grafana, so the two can never disagree
+    old = grafana_auth().partition(":")[2]
+    status, res = grafana("PUT", "/api/user/password", {"oldPassword": old, "newPassword": new, "confirmNew": new})
+    if status != 200:
+        raise FleetError(f"Grafana refused the change (HTTP {status}): {(res or {}).get('message', 'no details')}. Nothing was changed.")
+    write_env({"GRAFANA_ADMIN_PASSWORD": new})
+    print(f"{tick()} {bold('Grafana admin password changed')} and kept in .env (./fleet password --show prints it).")
+    if not args.ask:
+        print(f"  Login       admin / {bold(new)}")
+    print(dim("  Anything that used the old one (a saved browser login, a bookmark) needs the new one."))
+    return 0
 
 
 def cmd_down(args):
@@ -1101,7 +1199,7 @@ def cmd_status(args):
         print("  The stack is not fully running. Start it with: ./fleet up")
         return 1
     login = dashboard_state()
-    print(f"  Dashboard   http://localhost:3000   {dim({'ok': 'provisioned', 'login': 'login differs from admin/admin', 'missing': 'NOT provisioned'}.get(login, login))}")
+    print(f"  Dashboard   http://localhost:3000   {dim({'ok': 'provisioned', 'login': 'login refused (see .env)', 'missing': 'NOT provisioned'}.get(login, login))}")
     devices = fetch_devices()
     on = sum(1 for d in devices.values() if d["state"] == "ONLINE")
     print()
@@ -1335,6 +1433,15 @@ def cmd_remove(args):
 
 
 # ---------------------------------------------------------------- CLI
+def kind_arg(value):
+    if value not in ("ping", "tcp", "http", "metrics"):
+        forgot = any(c in value for c in ".:/") or value.isdigit()  # an address where the kind should be
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a kind: choose ping, tcp, http or metrics. The form is: ./fleet watch add <name> <kind> <address>."
+            + (f" It looks like the kind was left out, for example: ./fleet watch add router ping {value}" if forgot else ""))
+    return value
+
+
 def device_id_arg(value):
     if not is_valid_device_id(value):
         raise argparse.ArgumentTypeError(
@@ -1399,7 +1506,7 @@ def build_parser():
                         description="Kinds: ping HOST | tcp HOST:PORT | http URL | metrics URL (a Prometheus /metrics page, "
                                     "for example ESPHome's or an exporter's: its numbers are stored too).")
     s.add_argument("device_id", metavar="id", type=device_id_arg)
-    s.add_argument("kind", choices=["ping", "tcp", "http", "metrics"])
+    s.add_argument("kind", type=kind_arg, metavar="{ping,tcp,http,metrics}")
     s.add_argument("target", help="host (ping), host:port (tcp) or an http(s):// address (http, metrics)")
     s.add_argument("--interval", type=float, metavar="SECONDS", help="how often to check (default 15, 5 to 3600)")
     s.add_argument("--timeout", type=float, metavar="SECONDS", help="how long to wait for an answer (default 5)")
@@ -1418,14 +1525,21 @@ def build_parser():
     s.set_defaults(func=cmd_watch_remove)
     wp.set_defaults(func=lambda a: wp.print_help() or 0)
 
-    n = sub.add_parser("notify", help="send alerts to Discord, Slack, Telegram or a webhook")
+    s = sub.add_parser("password", help="change the Grafana admin password (random by default), or show it")
+    pw = s.add_mutually_exclusive_group()
+    pw.add_argument("--ask", action="store_true", help="type the new password yourself (hidden) instead of getting a random one")
+    pw.add_argument("--show", action="store_true", help="print the password kept in .env and change nothing")
+    s.set_defaults(func=cmd_password)
+
+    n = sub.add_parser("notify", help="send alerts to ntfy, Telegram, Discord, Slack or a webhook")
     nsub = n.add_subparsers(dest="notify_cmd", metavar="<action>")
     s = nsub.add_parser("set", help="choose where alerts go (the address or token goes straight into Grafana)")
     s.add_argument("type", choices=sorted(NOTIFY_TYPES), help="where to send alerts")
     s.add_argument("values", nargs="*", metavar="value",
-                   help="webhook URL (discord, slack, webhook) or '<bot-token> <chat-id>' (telegram); "
-                        "leave out to be asked, with the input hidden")
+                   help="a topic name or https://your.server/topic (ntfy), a webhook URL (discord, slack, webhook) or "
+                        "'<bot-token> <chat-id>' (telegram); leave out to be asked, with the input hidden")
     s.add_argument("--force", action="store_true", help="replace a notification policy you customised in Grafana")
+    s.add_argument("--random-topic", action="store_true", help="ntfy only: make a long random topic name for you (and say what it is)")
     s.add_argument("--no-wait", action="store_true", help="do not wait (about a minute) for Grafana to switch over")
     s.set_defaults(func=cmd_notify_set)
     s = nsub.add_parser("test", help="send a test message through the saved destination")
