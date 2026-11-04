@@ -66,8 +66,9 @@ cd icu-observability-stack
 ```
 
 It starts everything, waits until each part answers, and prints the dashboard address and where devices report to.
-Open the dashboard address (<http://localhost:3000> on the server itself) and log in with `admin` / `admin`
-(Grafana may ask for a new password; you can skip that). The **Device Fleet** dashboard is the home page, empty for now.
+Open the dashboard address (<http://localhost:3000> on the server itself) and log in as `admin` with the password it printed.
+On a first install `./fleet up` makes a random one and keeps it in `.env` (`./fleet password --show` prints it again;
+`./fleet password` changes it). The **Device Fleet** dashboard is the home page, empty for now.
 
 **Give the server a stable address.** Devices find it by its IP address (`./fleet up` and `./fleet add` print it). If the
 address changes (ordinary DHCP, or a phone hotspot, which picks a new subnet from time to time) devices silently stop
@@ -224,11 +225,17 @@ Runs E and J.
 |---|---|
 | See everything | `./fleet list` or the dashboard |
 | Retire a device for good | `./fleet remove kitchen-pi` (asks first, deletes its data; for a watched target use `./fleet watch remove`) |
+| See or change the dashboard password | `./fleet password --show`, `./fleet password` (a random new one), `./fleet password --ask` (your own) |
 | Stop the server, keep the data | `./fleet down` (asks first) |
 | Stop it and delete all data | `./fleet down --wipe` (asks twice) |
 | Start it again | `./fleet up` (it remembers MQTT, watching and check-in) |
 | Update to a newer version | `git pull`, then `./fleet up` |
 | Turn the MQTT input or check-in URL off | `./fleet up --no-mqtt`, `./fleet up --no-checkin` |
+
+**After a power cut or a reboot** the server starts again by itself (the database, dashboard and collector restart with
+Docker), as long as Docker starts at boot: `systemctl is-enabled docker` should say `enabled` (if not: `sudo systemctl
+enable docker`). The agent service on a device starts at boot too. This was tested by restarting Docker, not by cutting
+the power.
 
 A retired device that is not removed stays on the dashboard as OFFLINE for a day, with its alert. Devices keep trying
 while the server is down; after a short outage (about half a minute, the only length tested) they resumed by themselves.
@@ -252,7 +259,7 @@ within about 20 s.
 `./fleet` only wraps these, so you can always run them directly:
 
 ```bash
-docker compose up -d       # = ./fleet up, without waiting for readiness
+docker compose up -d       # = ./fleet up, without waiting for readiness (Grafana then uses the password in .env, or `admin`)
 docker compose down        # = ./fleet down, without asking (use `docker compose --profile '*' down` if MQTT, watching or check-in is on)
 docker compose down -v     # = ./fleet down --wipe, without asking: ALSO DELETES stored data
 ```
@@ -337,7 +344,8 @@ the subnet changes and the device ends up unreachable.
 
 > **Trusted networks only.** Port 4317 has **no authentication and no TLS**. Anyone who can reach it
 > can write metrics under any device name. Use it on a private LAN or VPN, never on the open internet.
-> The Grafana login is the default `admin` / `admin`.
+> A new install gets a random Grafana password; one made by an earlier version keeps `admin` / `admin` until you run
+> `./fleet password`.
 
 ---
 
@@ -388,15 +396,16 @@ Then `docker compose up -d`. Without `-v`, old devices stay on the dashboard for
 The stack provisions a data source with that name. If your Grafana volume already holds one that you
 created by hand, delete that one in Grafana (Connections, Data sources) or do a clean reset as above.
 
-**I forgot the Grafana password** (for example you changed it when Grafana asked on first login).
-Reset it to `admin` without touching your dashboard, alert rule or data:
+**I forgot the Grafana password.** First try `./fleet password --show`: it prints the one kept in `.env`. If you
+changed it inside Grafana yourself, `./fleet` no longer knows it. Set a new one without touching your dashboard, alert
+rule or data (replace `NEW-PASSWORD`), and tell `./fleet` about it:
 
 ```bash
-docker compose exec grafana grafana cli admin reset-admin-password admin
+docker compose exec grafana grafana cli admin reset-admin-password NEW-PASSWORD
 ```
 
-If your browser still rejects `admin` / `admin`, it may be auto-filling an old saved password; try a
-private window.
+Then put `GRAFANA_ADMIN_PASSWORD=NEW-PASSWORD` in the `.env` file. If your browser still rejects the new password, it may
+be auto-filling an old saved one; try a private window.
 
 ---
 
@@ -433,7 +442,7 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 
 ## Known limitations
 
-- **No authentication or TLS** anywhere: agents send plaintext gRPC and anyone who can reach port 4317 can inject data. Grafana uses `admin` / `admin`.
+- **No authentication or TLS** anywhere: agents send plaintext gRPC and anyone who can reach port 4317 can inject data. A new install gets a random Grafana password; one made by an earlier version keeps `admin` / `admin` until you run `./fleet password`.
 - **No device registry.** A device that has never reported is invisible, and a device silent for more than a day drops off the dashboard. That is why `./fleet add` cannot "create" a device on the server: a device exists once it reports.
 - **`./fleet` runs on the server only.** It prints the commands for a device but cannot install the agent there; on a device, `agent/install-service.sh` makes the agent start at boot (systemd only). `./fleet` and the installer were tested on x86_64 Linux, and the owner ran them on a Raspberry Pi 5 (see below).
 - **Notifications are opt-in.** Until you run `./fleet notify set ...`, an alert is visible only inside Grafana (and its API). `fleet notify` covers ntfy, Telegram, Discord, Slack and webhooks, not email. Only the webhook path (and ntfy, against a stand-in server) was tested end to end; nothing has reached a real phone yet.

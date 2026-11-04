@@ -223,7 +223,8 @@ class UpTests(WithEnv):
         self.assertEqual(code, 0)
         self.assertEqual(self.up_commands(), [["docker", "compose", "up", "-d"]])
         self.assertNotIn("MQTT", out)
-        self.assertFalse(os.path.exists(self.env_path))
+        # a first install gets a Grafana password in .env (see test_fleet_password); nothing about MQTT is written
+        self.assertEqual({k for k in fleet.read_env() if k != "GRAFANA_ADMIN_PASSWORD"}, set())
 
     def test_mqtt_builds_the_bridge_and_prints_where_the_broker_is(self):
         code, out, _ = run(["up", "--mqtt"])

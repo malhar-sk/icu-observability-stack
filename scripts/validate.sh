@@ -14,7 +14,7 @@
 #
 # Environment overrides (defaults in brackets):
 #   VM_URL [http://localhost:8428]   GRAFANA_URL [http://localhost:3000]
-#   GRAFANA_AUTH [admin:admin]       OTLP_ENDPOINT [localhost:4317]
+#   GRAFANA_AUTH [admin:<the password in .env, else admin>]       OTLP_ENDPOINT [localhost:4317]
 #   PYTHON [.venv/bin/python if present, else python3]
 #   DEVICE_A [demo-pi-1]  DEVICE_B [demo-pi-2]  AGENT_SCRIPT [agent/device_agent.py]
 #   STACK_TIMEOUT [180] ONLINE_TIMEOUT [90] OFFLINE_TIMEOUT [90] ALERT_TIMEOUT [180]  (seconds)
@@ -26,7 +26,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 VM_URL="${VM_URL:-http://localhost:8428}"
 GRAFANA_URL="${GRAFANA_URL:-http://localhost:3000}"
-GRAFANA_AUTH="${GRAFANA_AUTH:-admin:admin}"
+# Grafana's login: GRAFANA_AUTH if given, else the password ./fleet keeps in .env, else Grafana's default.
+grafana_pw() { local p; p=$(sed -n 's/^GRAFANA_ADMIN_PASSWORD=//p' "$REPO_ROOT/.env" 2>/dev/null | head -1 | tr -d "'"); echo "${p:-admin}"; }
+USER_AUTH="${GRAFANA_AUTH:-}"; GRAFANA_AUTH="${USER_AUTH:-admin:$(grafana_pw)}"
+refresh_auth() { [ -n "$USER_AUTH" ] || GRAFANA_AUTH="admin:$(grafana_pw)"; }  # a first `./fleet up` creates the password
 OTLP_ENDPOINT="${OTLP_ENDPOINT:-localhost:4317}"
 DEVICE_A="${DEVICE_A:-demo-pi-1}"
 DEVICE_B="${DEVICE_B:-demo-pi-2}"

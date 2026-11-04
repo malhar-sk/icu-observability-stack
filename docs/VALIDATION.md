@@ -1,6 +1,6 @@
 # Validation report
 
-Ten runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer run G the MQTT input with the per-device offline limit, and run H `./fleet watch` run I the check-in URL, and run J the owner's Raspberry Pi 5 and ntfy notifications (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
+Eleven runs. Run D tested the `./fleet` helper, run E its `notify` command, run F the start-at-boot service installer run G the MQTT input with the per-device offline limit, and run H `./fleet watch` run I the check-in URL, and run J the owner's Raspberry Pi 5 and ntfy notifications, and run K the server restarting by itself and Grafana's password (see their own sections below). Runs A and B were on an x86_64 VM and were driven by an AI agent. Run C was on a
 **Raspberry Pi 5** and was run by the Pi's owner at the keyboard over SSH, with an AI supplying the
 commands step by step. **Nobody has followed the README cold, and no separate device has pushed to
 the server over the network**; see the items marked PARTIAL and the "Not validated" list.
@@ -260,6 +260,23 @@ documentation or reach a real server from here.
 | Unit tests | PASS | **370 run, 369 pass, 1 skipped** (as root) in about 31 s, including 18 new ntfy tests and one for the friendlier `watch add` error. A "golden" test pins the exact template that was run through Grafana, so changing it forces a re-check. |
 | **Not tested** | | The real ntfy.sh, the ntfy phone app, a self-hosted ntfy with login or tokens (not supported), and Telegram, Discord and Slack against the real services. Whether iPhone push through ntfy.sh behaves differently from Android was not looked into. |
 
+## Run K: the server restarts by itself, and Grafana's password (x86_64 sandbox, real containers)
+
+Two gaps found by reading `docker-compose.yml` while asked what mattered most: the database, dashboard and collector had no
+restart policy (only the optional parts did), so after a power cut the dashboard would stay down until someone ran
+`./fleet up`; and Grafana's login was the well-known `admin` / `admin`.
+
+| Check | Result | Evidence |
+|---|---|---|
+| The premise: no policy means it stays down | CONFIRMED | Two throwaway containers through a Docker daemon restart: the one without a restart policy stayed down (`Exited (137)`), the one with `unless-stopped` came back. |
+| The three core services come back by themselves | PASS | After a clean Docker shutdown and start, **without running `./fleet up`**, VictoriaMetrics, Grafana and the collector were all running again within seconds; Grafana answered with the same password and VictoriaMetrics was healthy. Done twice. **This restarts Docker; it is not a real power cut or reboot, and it was not done on the Pi.** |
+| A first install gets a random password | PASS | After `down --wipe`, `./fleet up` printed `Login admin / <24 hex characters>`. `.env` was mode 600. That password gave HTTP 200 and `admin` / `admin` gave 401. `./fleet notify status` kept working. |
+| An existing install is left alone | PASS | Grafana created with the default login: `./fleet up` did not create `.env`, and printed "the well-known default: change it with ./fleet password". `./fleet password` then changed it in Grafana and `.env` in one step: the old login gave 401, the new one 200, and `./fleet` kept working. A later `./fleet up` says "the password in .env". |
+| Updating cannot lock anyone out | PASS | Grafana recreated with a *different* `GF_SECURITY_ADMIN_PASSWORD` on an existing database kept its own password (200) and ignored the new value (401). The setting only takes effect when the database is first created. |
+| The scripts follow the new login | PASS | `scripts/validate_checkin.sh` **30 of 30 from a wipe**: its own `./fleet up` created the password in the middle of the run and the later alert checks, which call Grafana's API, used it. |
+| Unit tests | PASS | **400 run, 399 pass, 1 skipped** (as root) in about 34 s, including 30 new ones (login precedence, first-install generation and the cases where it must not happen, the password command, restart policies in the compose file, the scripts). |
+| **Not tested** | | A real reboot or power cut, on the Pi or anywhere. That Docker starts at boot on the Pi (the README says how to check). `--ask`'s hidden prompt in a real terminal (unit-tested with a mock only). Updating the owner's Pi itself. |
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -342,6 +359,9 @@ rendered dashboard; that was checked separately with screenshots.
 | 29 | The MQTT bridge accepted a declared interval up to 86400 s, but the dashboard only looks back one day, so such a board would have vanished after a day instead of showing OFFLINE. | Low | Found while writing the check-in service. The limit is now 28800 s (8 h) for MQTT and the check-in URL alike. |
 | 30 | Leaving the kind out of `./fleet watch add router 10.0.0.1` gave "invalid choice: '10.0.0.1' (choose from ping, tcp, http, metrics)", which does not say what to do. | Low | Found when the owner typed it on the Pi. The error now shows the form and the fix with their own address: `./fleet watch add router ping 10.0.0.1`. |
 | 31 | My first two timing scripts for the ntfy test counted messages left over from earlier runs in the same log and reported an impossible result (an OFFLINE message 9 s after a check-in). | Process | Noticed because the number was impossible. Redone with an emptied log, a new device name, and the stand-in server's own timestamps. |
+| 32 | The database, dashboard and collector had no restart policy, so after a power cut or reboot the server stayed down (while the optional MQTT, watcher and check-in services came back). A monitoring tool that silently stops monitoring after a blip is the worst failure it can have. | High | Found by reading the compose file. All three now restart (`unless-stopped`); checked through a Docker restart, with a control. |
+| 33 | Grafana's login was the well-known `admin` / `admin`. | Medium | A new install now gets a random password in `.env`; `./fleet password` changes or shows it; existing installs are left alone with a notice. |
+| 34 | While adding that, my first version created `.env` *before* the busy-port check, so a refused `./fleet up --mqtt` was no longer "change nothing". | Low | Caught by an existing test; the password step now runs after the checks. |
 
 ## Not validated
 
@@ -360,5 +380,6 @@ rendered dashboard; that was checked separately with screenshots.
 - **The new README workflow followed by a person** on a fresh laptop or Pi, including Docker's installer script (not run here).
 - **`./fleet watch` against most real things:** a NAS, a PLC port, an ESPHome board, a Klipper or Prusa exporter, a real `node_exporter`. A router was pinged from a Raspberry Pi (run J); everything else used a container, VictoriaMetrics' own exporter and ESPHome-style sample text.
 - **https targets, `--insecure` and certificate errors:** no TLS server was available, so none of that was run. IPv6 targets were not run either, and `.local` names were not tried (the guide says they usually do not resolve inside Docker).
+- **A real reboot or power cut**, on the Pi or anywhere (run K only restarted Docker), and whether Docker starts at boot on the owner's Pi.
 - Last Will handling (not implemented: a board is OFFLINE by silence) and topics from Tasmota, ESPHome, Zigbee2MQTT or Home Assistant (not mapped).
 - `install-service.sh` on any real device other than the Pi 5 (it ran there, run J), a real power cycle (never done), systemd older than 247 (the `ProtectProc` option would be ignored with a warning; not tried), other distributions, and a device with no internet (the installer needs it once).

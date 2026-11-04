@@ -10,6 +10,7 @@
   ./fleet remove <id>         forget a retired device (deletes its stored data, asks first)
   ./fleet watch add|list|remove   watch things that cannot run the agent: a ping, a port, a web page, a metrics endpoint
   ./fleet notify set|test|status|off   send alerts to ntfy, Telegram, Discord, Slack or a webhook
+  ./fleet password [--ask|--show]      change the Grafana admin password (a random one by default), or show it
 
 Run it on the machine that hosts the stack. Needs Docker with Compose v2 and Python 3.9+, nothing else.
 Demonstration tool: no authentication or TLS anywhere (see README, Known limitations).
@@ -39,7 +40,7 @@ from device_agent import DEVICE_ID_RE, is_valid_device_id  # noqa: E402  one sou
 
 VM_URL = os.environ.get("FLEET_VM_URL", "http://localhost:8428").rstrip("/")
 GRAFANA_URL = os.environ.get("FLEET_GRAFANA_URL", "http://localhost:3000").rstrip("/")
-GRAFANA_AUTH = os.environ.get("FLEET_GRAFANA_AUTH", "admin:admin")
+GRAFANA_AUTH = os.environ.get("FLEET_GRAFANA_AUTH")  # "user:password"; when unset, grafana_auth() uses the password kept in .env
 OTLP_PORT = 4317
 MQTT_PORT = 1883
 ENV_FILE = os.path.join(ROOT, ".env")  # holds the MQTT settings; gitignored because the password is a secret
@@ -170,9 +171,14 @@ def port_open(host, port, timeout=2):
         return False
 
 
+def grafana_auth():
+    """'admin:<password>' for Grafana's API: an explicit FLEET_GRAFANA_AUTH, else the password kept in .env, else the default."""
+    return GRAFANA_AUTH or "admin:" + (read_env().get("GRAFANA_ADMIN_PASSWORD") or "admin")
+
+
 def dashboard_state():
     try:
-        status, _ = http("GET", GRAFANA_URL + "/api/dashboards/uid/device-fleet", auth=GRAFANA_AUTH, timeout=5)
+        status, _ = http("GET", GRAFANA_URL + "/api/dashboards/uid/device-fleet", auth=grafana_auth(), timeout=5)
     except FleetError:
         return "unreachable"
     return {200: "ok", 401: "login", 403: "login", 404: "missing"}.get(status, f"http {status}")
@@ -811,11 +817,11 @@ NEVER = "0001-01-01"  # Grafana's "no attempt yet" timestamp prefix
 def grafana(method, path, body=None):
     """Call Grafana's API. Returns (status, parsed JSON or None); raises with advice if the login is wrong."""
     data = json.dumps(body).encode() if body is not None else None
-    status, raw = http(method, GRAFANA_URL + path, data=data, auth=GRAFANA_AUTH, timeout=15,
+    status, raw = http(method, GRAFANA_URL + path, data=data, auth=grafana_auth(), timeout=15,
                        headers={"Content-Type": "application/json", "X-Disable-Provenance": "true"})
     if status in (401, 403):
-        raise FleetError("Grafana refused the login (default admin / admin). If you changed the password, run with "
-                         "FLEET_GRAFANA_AUTH=admin:<your password>")
+        raise FleetError("Grafana refused the login. If you changed the admin password in Grafana yourself, tell ./fleet: put "
+                         "GRAFANA_ADMIN_PASSWORD=<your password> in .env (or run with FLEET_GRAFANA_AUTH=admin:<your password>)")
     try:
         return status, (json.loads(raw) if raw else None)
     except ValueError:
@@ -1010,6 +1016,19 @@ def cmd_notify_off(args):
 
 
 # ---------------------------------------------------------------- commands
+def prepare_grafana_password():
+    """First install only: give Grafana a random admin password (kept in .env) instead of the well-known default.
+    Returns it when it was just made. An existing Grafana already has a password, so it is left alone."""
+    if read_env().get("GRAFANA_ADMIN_PASSWORD"):
+        return None
+    r = subprocess.run(["docker", "volume", "ls", "-q"], capture_output=True, text=True)
+    if r.returncode or any(v == "grafana_data" or v.endswith("_grafana_data") for v in r.stdout.split()):
+        return None  # cannot tell, or Grafana already exists with a password of its own: change nothing
+    password = secrets.token_hex(12)
+    write_env({"GRAFANA_ADMIN_PASSWORD": password})
+    return password
+
+
 def cmd_up(args):
     require_docker()
     if args.mqtt or (mqtt_mode() == "bundled" and not (args.mqtt_broker or args.no_mqtt)):
@@ -1026,6 +1045,7 @@ def cmd_up(args):
     if mode and subprocess.run(["docker", "image", "inspect", BRIDGE_IMAGE], capture_output=True).returncode:
         print("First MQTT run: building the bridge (downloads a small Python image, about 70 MB).")
         print(dim("  This needs internet access once."))
+    new_password = prepare_grafana_password()  # after the checks above: a refused `up` must change nothing
     started = time.time()
     if args.no_checkin:
         stop_checkin()
@@ -1059,8 +1079,12 @@ def cmd_up(args):
     print(f"{tick()} {bold('Stack is up')} {dim('(%ds)' % (time.time() - started))}")
     print()
     print(f"  Dashboard   http://localhost:3000" + (f"   (from other machines: http://{ip}:3000)" if ip else ""))
-    if login == "ok":
-        print(f"  Login       admin / admin   {dim('(Grafana may ask for a new password: you can skip it)')}")
+    if new_password:
+        print(f"  Login       admin / {bold(new_password)}   {dim('(made for you and kept in .env: ./fleet password --show)')}")
+    elif read_env().get("GRAFANA_ADMIN_PASSWORD"):
+        print(f"  Login       admin / the password in .env   {dim('(./fleet password --show prints it)')}")
+    elif login == "ok":
+        print(f"  Login       admin / admin   {yellow('the well-known default: change it with ./fleet password')}")
     elif login == "login":
         print("  Login       admin / the password you set")
     print(f"  Devices report to   {(ip or 'localhost')}:{OTLP_PORT}")
@@ -1083,6 +1107,35 @@ def cmd_up(args):
     if notify_configured() is False:
         print("  Alerts show in Grafana only.    ./fleet notify set ntfy|telegram|discord|slack|webhook")
     print("  Stop everything with:           ./fleet down")
+
+
+def cmd_password(args):
+    env = read_env()
+    if args.show:
+        print(env.get("GRAFANA_ADMIN_PASSWORD") or "admin   (Grafana's default: ./fleet has not set one. Change it with ./fleet password)")
+        return 0
+    require_stack()
+    if args.ask:
+        if not sys.stdin.isatty():
+            raise FleetError("--ask needs a terminal (without it, ./fleet password makes a random one)")
+        new = getpass.getpass("New Grafana admin password (input is hidden): ")
+        if getpass.getpass("Again: ") != new:
+            raise FleetError("the two passwords differ; nothing was changed")
+        if len(new) < 8:
+            raise FleetError("use at least 8 characters; nothing was changed")
+    else:
+        new = secrets.token_hex(12)
+    env_quote(new)  # refuse a password .env cannot hold BEFORE touching Grafana, so the two can never disagree
+    old = grafana_auth().partition(":")[2]
+    status, res = grafana("PUT", "/api/user/password", {"oldPassword": old, "newPassword": new, "confirmNew": new})
+    if status != 200:
+        raise FleetError(f"Grafana refused the change (HTTP {status}): {(res or {}).get('message', 'no details')}. Nothing was changed.")
+    write_env({"GRAFANA_ADMIN_PASSWORD": new})
+    print(f"{tick()} {bold('Grafana admin password changed')} and kept in .env (./fleet password --show prints it).")
+    if not args.ask:
+        print(f"  Login       admin / {bold(new)}")
+    print(dim("  Anything that used the old one (a saved browser login, a bookmark) needs the new one."))
+    return 0
 
 
 def cmd_down(args):
@@ -1146,7 +1199,7 @@ def cmd_status(args):
         print("  The stack is not fully running. Start it with: ./fleet up")
         return 1
     login = dashboard_state()
-    print(f"  Dashboard   http://localhost:3000   {dim({'ok': 'provisioned', 'login': 'login differs from admin/admin', 'missing': 'NOT provisioned'}.get(login, login))}")
+    print(f"  Dashboard   http://localhost:3000   {dim({'ok': 'provisioned', 'login': 'login refused (see .env)', 'missing': 'NOT provisioned'}.get(login, login))}")
     devices = fetch_devices()
     on = sum(1 for d in devices.values() if d["state"] == "ONLINE")
     print()
@@ -1471,6 +1524,12 @@ def build_parser():
     s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     s.set_defaults(func=cmd_watch_remove)
     wp.set_defaults(func=lambda a: wp.print_help() or 0)
+
+    s = sub.add_parser("password", help="change the Grafana admin password (random by default), or show it")
+    pw = s.add_mutually_exclusive_group()
+    pw.add_argument("--ask", action="store_true", help="type the new password yourself (hidden) instead of getting a random one")
+    pw.add_argument("--show", action="store_true", help="print the password kept in .env and change nothing")
+    s.set_defaults(func=cmd_password)
 
     n = sub.add_parser("notify", help="send alerts to ntfy, Telegram, Discord, Slack or a webhook")
     nsub = n.add_subparsers(dest="notify_cmd", metavar="<action>")
