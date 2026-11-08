@@ -277,6 +277,25 @@ restart policy (only the optional parts did), so after a power cut the dashboard
 | Unit tests | PASS | **400 run, 399 pass, 1 skipped** (as root) in about 34 s, including 30 new ones (login precedence, first-install generation and the cases where it must not happen, the password command, restart policies in the compose file, the scripts). |
 | **Not tested** | | A real reboot or power cut, on the Pi or anywhere. That Docker starts at boot on the Pi (the README says how to check). `--ask`'s hidden prompt in a real terminal (unit-tested with a mock only). Updating the owner's Pi itself. |
 
+## Run L: the read-only interface, MCP server and HTTP API (x86_64 sandbox, real stack, run by an AI agent)
+
+New code in `interface/`: four read-only questions (`stack_status`, `list_devices`, `get_device`, `how_to_add_device`), an
+HTTP API, and an MCP server **written from scratch with the standard library** (the owner asked to avoid depending on the
+SDK for supply-chain reasons; the SDK's install is 27 extra packages). Read: [docs/INTERFACE.md](INTERFACE.md).
+
+| Check | Result | Evidence |
+|---|---|---|
+| The whole thing against the real stack | PASS, **51 of 51** on the second run | `scripts/validate_interface.sh`: `./fleet up`, two devices added with `curl` through the check-in URL, the real API process, the real MCP server over real pipes. The first run scored 49 of 51 and both failures were real (issues 36 and 38); fixed, then 51 of 51. |
+| It agrees with `./fleet list` | PASS | The set of (device, state) pairs from the API equalled `./fleet list --json`. A device that declared nothing went OFFLINE **36 s** after its only check-in (30 s rule plus the ingest delay); the API gave `offline_after_seconds` 30, said why ("has not said how often it reports") and what to try; the slow device (declared 60 s, limit 180 s) stayed ONLINE meanwhile. |
+| MCP over real pipes with no packages | PASS | The server ran as `python3 -S` (no installed package visible). A stdlib client did the handshake, listed four tools (all read-only), called all of them, got an error *result* for a missing argument, `-32602` for an unknown tool (there is no remove tool), `-32601` for `server/discover`, and the server exited 0 when the pipe closed. |
+| The official client as referee | PASS | Its default mode (probes `server/discover`, falls back to `initialize`) and its `legacy` mode both connected, agreed on 2025-11-25, called two tools and got the same answers. It validates the tool descriptions and output against its own types. |
+| No secret leaves | PASS | The key, Grafana password and (when set) MQTT password were searched for in **21 KB** of everything the API and MCP returned, and in the API's log: not found. `how_to_add_device` showed `<CHECKIN_KEY>`. |
+| Nothing is changed | PASS | A hash of `.env` and the watch list and the id and state of every container were identical before and after the whole run; POST, PUT, DELETE and PATCH all got 405; both devices were still there. |
+| The network rules | PASS | `--host 0.0.0.0` without a token refused to start and named `FLEET_API_TOKEN`; a short token was refused; with a token: 401 without it, 401 with a wrong one, 401 with it in the address, 200 with the header; a foreign `Host` header got 403. |
+| Unit tests | PASS | **510 run** (400 existing plus 110 new). Both with the official client installed (2 skipped: one that needs a non-root user, and IPv6) and with no package installed at all, `python3 -S` (7 skipped: those two plus the 5 referee tests). New: 66 in `tests/test_interface.py` and 44 in `tests/test_interface_mcp.py` (the protocol rules; the real program over pipes with bad, oversized, cut-off and non-ASCII input and a check that stray prints cannot reach stdout; the referee). |
+| Syntax | PASS | All `interface/` files parse under the Python 3.9 grammar. `shellcheck` clean on the new script. |
+| **Not tested** | | Claude Desktop, Claude Code or any real assistant app. The MCP server over SSH from another machine. The API with a token over a real network, or with TLS. IPv6 (this machine cannot bind `::1`; the test skips). Any Python but 3.13, and any OS but Linux. The protocol specification itself (the site was unreachable from the build machine): the wire format came from the official SDK's type definitions and the client above. The interface on the owner's Pi. |
+
 ## Definition of Done
 
 | # | Item | Result | Evidence |
@@ -362,8 +381,16 @@ rendered dashboard; that was checked separately with screenshots.
 | 32 | The database, dashboard and collector had no restart policy, so after a power cut or reboot the server stayed down (while the optional MQTT, watcher and check-in services came back). A monitoring tool that silently stops monitoring after a blip is the worst failure it can have. | High | Found by reading the compose file. All three now restart (`unless-stopped`); checked through a Docker restart, with a control. |
 | 33 | Grafana's login was the well-known `admin` / `admin`. | Medium | A new install now gets a random password in `.env`; `./fleet password` changes or shows it; existing installs are left alone with a notice. |
 | 34 | While adding that, my first version created `.env` *before* the busy-port check, so a refused `./fleet up --mqtt` was no longer "change nothing". | Low | Caught by an existing test; the password step now runs after the checks. |
+| 35 | A misspelt parameter such as `?stat=offline` was silently ignored and returned *everything*. | Medium | Caught by a unit test I wrote for bad requests. Unknown parameters are now a 400 saying what the question takes. |
+| 36 | The API's access log recorded the whole request line, so a client that put the access token in the address by mistake (`?token=...`, which is refused) still had the token written to the log file. | Medium | Found by the live check "the token is not in the server's log" (run 1 of the script: 49 of 51). The log now holds method, path and status only, and the token is scrubbed from every other log message. |
+| 37 | My fix for 36 crashed (a traceback in the log) on a request too malformed to parse, because the path and method do not exist yet at that point. | Low | Caught by the unit test I wrote for it; they are read defensively now, and the test covers a one-word request line. |
+| 38 | A field changed type between devices: `offline_after_seconds` was `30` (integer) for the floor and `180.0` (float) otherwise. | Low | Found by the live check on the first run. The interface now always gives a float. |
+| 39 | My first draft of the new tests had leftover no-op lines (`... if False else None`) and one placeholder test that asserted almost nothing. | Process | Found on re-reading; removed, and the placeholder replaced by a test that calls every feature with the stack up and down. |
 
 ## Not validated
+
+- **Any real AI assistant app with the MCP server** (Claude Desktop, Claude Code and others): only the official SDK's client and a hand-written client were used (run L). The protocol specification was not read, because the site could not be reached.
+- The interface from another machine (MCP over SSH, the API with a token over a network, TLS), IPv6, and Python or operating systems other than 3.13 on Linux.
 
 - A separate device pushing to the server over the network (port 4317 from another machine), or any firewall behaviour.
 - 32-bit Raspberry Pi OS, Pi Zero-class hardware, and ESP32-class devices (the agent is Linux-only; an HTTP path to port 4318 worked in a `curl` test only).

@@ -240,6 +240,22 @@ the power.
 A retired device that is not removed stays on the dashboard as OFFLINE for a day, with its alert. Devices keep trying
 while the server is down; after a short outage (about half a minute, the only length tested) they resumed by themselves.
 
+### 8. Let an AI assistant or a script ask questions (optional)
+
+The server can answer questions about itself, **read-only**: which devices are up, why one is offline, and the exact
+steps to add a device of each kind (an assistant can use the last one to help you set things up). Two ways in, both
+standard library only, so there is nothing extra to install:
+
+```bash
+python3 interface/http_api.py                     # then: curl http://127.0.0.1:8765/v1/list_devices
+python3 interface/mcp_server.py --print-config    # prints the settings to paste into an AI assistant's MCP settings
+```
+
+Neither can change anything, neither shows a password, and the API listens on this machine only unless you give it a token.
+The MCP server is written from scratch rather than using the SDK (no dependencies to be attacked through). Tested with the
+official MCP client library; **not** yet with the Claude Desktop or Claude Code apps. Details, safety rules, and how to add
+or remove a question: **[docs/INTERFACE.md](docs/INTERFACE.md)**.
+
 ### Not ready for real devices? Try it with two pretend ones
 
 On the server itself, in the repository folder:
@@ -275,6 +291,7 @@ cleans up afterwards. Record results in [docs/VALIDATION.md](docs/VALIDATION.md)
 | `scripts/validate_mqtt.sh` | the MQTT input: access control, labels, a slow board, offline detection, the alert | about 4 min |
 | `scripts/validate_watch.sh` | `./fleet watch`: ping, port, pages, a real exporter, a hostile page, stop and start, the alert | about 6 min |
 | `scripts/validate_checkin.sh` | the check-in URL with the real container and `curl`: the key, bad input, a slow device, offline and back | about 3 min |
+| `scripts/validate_interface.sh` | the read-only API and MCP server on the real stack: agreement with `./fleet list`, no leaked secrets, nothing changed, the network rules | about 3 min |
 
 ---
 
@@ -450,6 +467,7 @@ Vector (`vector.toml`) is not part of the default stack. It is parked behind the
 - **Watching is from the server's side only.** The watcher sees what its container sees, cannot send a login or token, and for a watched target "uptime" means time answering continuously, not time since boot. A target that has never answered is invisible, like any device. Tested against real containers and a real exporter (VictoriaMetrics' own `/metrics`) and ESPHome-style sample output; **no real ESPHome board, router or PLC was available**. See [docs/WATCH.md](docs/WATCH.md).
 - **The check-in URL is plain HTTP with one shared key.** Anyone on your network who has the key can report as any device. A device can check in at most every 5 s and at slowest every 8 h (the dashboard looks back one day). Tested with `curl` against the container on x86, and the owner ran the printed command on a Raspberry Pi 5 and the device appeared; routers, `wget` and boards calling the URL themselves were not tried. See [docs/CHECKIN.md](docs/CHECKIN.md).
 - **MQTT is plain and shared.** No TLS, one shared password for all boards, our `fleet/<device_id>/<metric>` topic scheme only (Tasmota, ESPHome, Zigbee2MQTT and Home Assistant topics are not mapped), and no Last Will handling: a board is OFFLINE by silence. Tested with simulated devices and a real broker, on x86 and on a Raspberry Pi 5 (the bridge built and ran on arm64); **no real ESP32, Pico or Arduino was available**. See [docs/MQTT.md](docs/MQTT.md).
+- **The question interface (`interface/`) is read-only, local by default, and plain HTTP.** It listens on this machine only unless `FLEET_API_TOKEN` is set, and has no TLS. It was tried with the official MCP client library and `curl`, not with real assistant apps, and not from another machine. See [docs/INTERFACE.md](docs/INTERFACE.md).
 - **Temperature** is reported only where `/sys/class/thermal` provides it.
 - **Single node, demo scale.** One VictoriaMetrics, one Collector, one Grafana, no redundancy or retention tuning.
 - **Verified on x86_64 Linux and on one Raspberry Pi 5** (aarch64, Debian 13 "trixie"), where the stack and both demo agents ran on the same Pi and the dashboard was viewed from a laptop. Later, run by the Pi's owner on the same Pi: the agent installed as a service, a check-in URL device, a ping-watched router, and the MQTT broker and bridge with a simulated board. **Not yet verified:** a separate device pushing to the server over the network, 32-bit Raspberry Pi OS, Pi Zero-class hardware, and real ESP32-class boards (the agent is Linux-only; they use the MQTT input, tested only with simulated devices). See [docs/VALIDATION.md](docs/VALIDATION.md).
