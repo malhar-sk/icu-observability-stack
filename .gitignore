@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 watch/
+expected.json
+expected.json.tmp

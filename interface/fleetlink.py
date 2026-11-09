@@ -49,6 +49,16 @@ def devices():
     return _guard(read)
 
 
+def waiting(reporting):
+    """({device_id: {"device_id", "kind", "added"}}, warning): the devices a person registered with ./fleet add or watches
+    that are not in `reporting`. A list that cannot be read is a warning, not an error: the rest should still answer."""
+    f = fleet()
+    try:
+        return f.waiting_devices(reporting), None
+    except f.FleetError as exc:
+        return {}, str(exc)
+
+
 def stack():
     """Is each part of the server up, and which optional inputs are on? Asks the services directly; needs no Docker."""
     def read(f):
@@ -72,6 +82,18 @@ def stack():
             "ports": {"dashboard": 3000, "device_agent_endpoint": f.OTLP_PORT, "mqtt": f.MQTT_PORT, "checkin": checkin_port},
         }
     return _guard(read)
+
+
+def mqtt_endpoint():
+    """Where a board should connect: {"mode", "host", "port", "user"} (host is None when it is not known). Never the password."""
+    f = fleet()
+    env = f.read_env()
+    mode = f.mqtt_mode(env)
+    if mode == "external":
+        return {"mode": mode, "host": env.get("MQTT_HOST") or None, "port": int(env.get("MQTT_PORT") or f.MQTT_PORT),
+                "user": env.get("MQTT_USERNAME") or None}
+    return {"mode": mode, "host": f.lan_ip() if mode == "bundled" else None, "port": f.MQTT_PORT,
+            "user": env.get("MQTT_USERNAME", "fleet") if mode == "bundled" else None}
 
 
 def server_address():

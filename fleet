@@ -49,6 +49,7 @@ WATCHER_IMAGE = "python:3.13-alpine"    # the watcher runs the script from ./wat
 CHECKIN_PORT = 8081  # default; CHECKIN_PORT in .env changes the port published on this machine
 WATCH_DIR = os.path.join(ROOT, "watch")  # the target list lives here (gitignored); the watcher container reads it
 TARGETS_FILE = os.path.join(WATCH_DIR, "targets.json")
+EXPECTED_FILE = os.path.join(ROOT, "expected.json")  # devices a person said they expect (./fleet add); gitignored
 WATCH_FIRST_LOOK, WATCH_LOOK_EVERY = 8, 5  # seconds before `watch add` first reads the watcher's log, and how often after
 WATCH_SETTLE = 3  # seconds the watcher needs to notice a change to the list before its data is deleted
 HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
@@ -484,6 +485,66 @@ def write_targets(targets):
                          "remove it (sudo rm -r watch) and try again.")
 
 
+# ---------------------------------------------------------------- devices you expect
+# A device exists on the server only once it has reported, so a brand-new device (a board with no firmware yet) would be
+# invisible. `./fleet add` therefore notes that you expect it, and ./fleet list and the interface show it as WAITING until
+# its first report. The dashboard and the alert still only know devices that have reported.
+def read_expected():
+    """{device_id: {"kind": "agent|mqtt|checkin", "added": epoch seconds}} for the devices you registered with ./fleet add."""
+    try:
+        with open(EXPECTED_FILE) as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise FleetError(f"{EXPECTED_FILE} cannot be read ({exc}). Fix it, or delete it to start the list again.")
+    items = doc.get("devices") if isinstance(doc, dict) else None
+    if not isinstance(items, dict):
+        raise FleetError(f"{EXPECTED_FILE} is not a device list. Fix it, or delete it to start the list again.")
+    return {k: v for k, v in items.items() if is_valid_device_id(k) and isinstance(v, dict)}
+
+
+def write_expected(items):
+    try:
+        tmp = EXPECTED_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": 1, "devices": items}, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, EXPECTED_FILE)
+    except OSError as exc:
+        raise FleetError(f"cannot write {EXPECTED_FILE}: {exc}")
+
+
+def expect_device(device_id, kind):
+    """Note that a device is expected. Never stops an add: a problem with the list is only a warning."""
+    try:
+        items = read_expected()
+        items.setdefault(device_id, {"added": int(time.time())})["kind"] = kind
+        write_expected(items)
+    except FleetError as exc:
+        print(yellow(f"  Could not note that you expect '{device_id}' ({exc}); it will still appear once it reports."))
+
+
+def forget_device(device_id):
+    try:
+        items = read_expected()
+        if items.pop(device_id, None) is not None:
+            write_expected(items)
+    except FleetError as exc:
+        print(yellow(f"  Could not update the list of expected devices ({exc})."))
+
+
+def waiting_devices(reporting):
+    """{device_id: {"device_id", "kind", "added"}}: devices you expect, or watch, that are not in `reporting` (the ones
+    that reported in the last 24 hours). Raises FleetError when a list cannot be read."""
+    waiting = {d: {"device_id": d, "kind": e.get("kind") or "agent", "added": e.get("added")}
+               for d, e in read_expected().items() if d not in reporting}
+    for t in read_targets():
+        if t.get("id") not in reporting and t.get("id") not in waiting:
+            waiting[t.get("id")] = {"device_id": t.get("id"), "kind": "watch", "added": None}
+    return dict(sorted(waiting.items()))
+
+
 def set_watch_profile(on):
     env = read_env()
     profiles = [p for p in env.get("COMPOSE_PROFILES", "").split(",") if p and p != "watch"]
@@ -704,6 +765,7 @@ def cmd_add_checkin(args, existing):
     key, port = ensure_checkin()
     host = args.host or lan_ip() or "localhost"
     dev = args.device_id
+    expect_device(dev, "checkin")  # the checks are done: this add will go ahead
     url = f"http://{host}:{port}/checkin/{dev}?key={key}&every={args.every}"
     print(bold(f"Add device '{dev}' by check-in URL"))
     if existing:
@@ -1202,8 +1264,10 @@ def cmd_status(args):
     print(f"  Dashboard   http://localhost:3000   {dim({'ok': 'provisioned', 'login': 'login refused (see .env)', 'missing': 'NOT provisioned'}.get(login, login))}")
     devices = fetch_devices()
     on = sum(1 for d in devices.values() if d["state"] == "ONLINE")
+    waiting = waiting_or_warn(devices)
     print()
-    print(f"{bold('Devices')}  {on} online, {len(devices) - on} offline   {dim('(./fleet list for details)')}")
+    print(f"{bold('Devices')}  {on} online, {len(devices) - on} offline" + (f", {len(waiting)} waiting" if waiting else "")
+          + f"   {dim('(./fleet list for details)')}")
     configured = notify_configured()
     if configured is not None:
         print(f"{bold('Alerts')}   " + ("sent to your notification channel" if configured
@@ -1211,27 +1275,50 @@ def cmd_status(args):
     return 0
 
 
+def waiting_or_warn(devices):
+    """waiting_devices(), but a list that cannot be read is a warning, not the end of ./fleet list or status."""
+    try:
+        return waiting_devices(devices)
+    except FleetError as exc:
+        print(yellow(f"  Could not read the list of expected devices: {exc}"))
+        return {}
+
+
+def print_waiting(waiting):
+    if not waiting:
+        return
+    print(f"\n{bold('Waiting for a first report')} {dim('(registered with ./fleet add, or watched; not seen in the last 24 hours)')}")
+    rows = [[w["device_id"], w["kind"], f"registered {fmt_age(time.time() - w['added'])} ago" if w.get("added") else "watched"]
+            for w in waiting.values()]
+    table(["DEVICE", "WAY", "SINCE"], rows)
+    print(dim("  To see the steps again: ./fleet add <id> (with --mqtt or --checkin if that is how it reports). "
+              "To stop expecting it: ./fleet remove <id> (a watched one: ./fleet watch remove <id>)"))
+
+
 def cmd_list(args):
     require_stack()
     devices = fetch_devices()
-    if args.json:
+    if args.json:  # only the devices that have reported: scripts depend on this shape
         print(json.dumps(list(devices.values()), indent=2))
         return 0
-    if not devices:
+    waiting = waiting_or_warn(devices)
+    if not devices and not waiting:
         print("No device has reported in the last 24 hours.  Add one with: ./fleet add <device-id>")
         return 0
-    rows = [[d["device_id"], d["hostname"] or "-", d["state"],
-             fmt_age(d["age_seconds"]) + " ago", fmt_pct(d["cpu"]), fmt_pct(d["mem"]),
-             fmt_pct(d["disk"]), fmt_temp(d["temp"]), fmt_dur(d["uptime"])] for d in devices.values()]
+    if devices:
+        rows = [[d["device_id"], d["hostname"] or "-", d["state"],
+                 fmt_age(d["age_seconds"]) + " ago", fmt_pct(d["cpu"]), fmt_pct(d["mem"]),
+                 fmt_pct(d["disk"]), fmt_temp(d["temp"]), fmt_dur(d["uptime"])] for d in devices.values()]
 
-    def colour(i, plain, padded):
-        if i == 2:
-            return green(padded) if plain == "ONLINE" else red(padded)
-        return padded
+        def colour(i, plain, padded):
+            if i == 2:
+                return green(padded) if plain == "ONLINE" else red(padded)
+            return padded
 
-    table(["DEVICE", "HOST", "STATE", "LAST SEEN", "CPU", "MEM", "DISK", "TEMP", "UPTIME"], rows, colour)
-    on = sum(1 for d in devices.values() if d["state"] == "ONLINE")
-    print(f"\n  {on} online, {len(devices) - on} offline")
+        table(["DEVICE", "HOST", "STATE", "LAST SEEN", "CPU", "MEM", "DISK", "TEMP", "UPTIME"], rows, colour)
+        on = sum(1 for d in devices.values() if d["state"] == "ONLINE")
+        print(f"\n  {on} online, {len(devices) - on} offline" + (f", {len(waiting)} waiting" if waiting else ""))
+    print_waiting(waiting)
     return 0
 
 
@@ -1305,6 +1392,7 @@ def cmd_add_mqtt(args, existing):
         host, port = args.host or env.get("MQTT_HOST", ""), env.get("MQTT_PORT", str(MQTT_PORT))
         user, password = env.get("MQTT_USERNAME", ""), "<your broker password>"
     dev = args.device_id
+    expect_device(dev, "mqtt")  # the checks are done: this add will go ahead
     auth = (f" -u {user} -P '{password}'" if user else "")
     pub = f"mosquitto_pub -h {host} -p {port}{auth}"
     print(bold(f"Add device '{dev}' over MQTT"))
@@ -1357,6 +1445,7 @@ def cmd_add(args):
         return cmd_add_checkin(args, existing)
     host = args.host or lan_ip() or "localhost"
     endpoint = f"{host}:{OTLP_PORT}"
+    expect_device(args.device_id, "agent")  # the checks are done: this add will go ahead
     print(bold(f"Add device '{args.device_id}'"))
     if existing:
         print(yellow(f"  Note: '{args.device_id}' reported before (offline for {fmt_age(existing['age_seconds'])}). "
@@ -1410,9 +1499,18 @@ def cmd_remove(args):
         raise FleetError(f"'{args.device_id}' is being watched, so it would come straight back. "
                          f"Use: ./fleet watch remove {args.device_id}")
     d = fetch_devices().get(args.device_id)
+    if not d and args.device_id in read_expected():
+        print(f"'{args.device_id}' is registered but has not reported in the last 24 hours, so no data is stored for it. "
+              "This only stops expecting it.")
+        if not confirm("Stop expecting it? [y/N]", args.yes):
+            print("Aborted. Nothing was changed.")
+            return 1
+        forget_device(args.device_id)
+        print(f"{tick()} {bold('Forgot')} '{args.device_id}'. It is no longer listed as waiting.")
+        return 0
     if not d:
-        raise FleetError(f"no device '{args.device_id}' has reported in the last 24 hours, so there is nothing to remove. "
-                         "See: ./fleet list")
+        raise FleetError(f"no device '{args.device_id}' has reported in the last 24 hours, and none is registered, so there "
+                         "is nothing to remove. See: ./fleet list")
     if d["state"] == "ONLINE" and not args.force:
         raise FleetError(f"'{args.device_id}' is reporting right now (last seen {fmt_age(d['age_seconds'])} ago). "
                          "Stop its agent first, or pass --force to delete anyway (it comes back on its next report).")
@@ -1422,6 +1520,7 @@ def cmd_remove(args):
         print("Aborted. Nothing was changed.")
         return 1
     delete_device_data(args.device_id)
+    forget_device(args.device_id)
     for _ in range(10):
         if args.device_id not in fetch_devices():
             print(f"{tick()} {bold('Removed')} '{args.device_id}'. It is gone from ./fleet list and the dashboard table, "

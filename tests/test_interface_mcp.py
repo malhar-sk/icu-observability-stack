@@ -458,5 +458,192 @@ class TheOfficialClientAgrees(WithFakeVM):
                          {"stack_status", "list_devices"})
 
 
+# ----------------------------------------------------------------------------- 4. the same server over HTTP: POST /mcp
+def post_mcp(port, message=None, body=None, headers=None, host_header=None, content_type="application/json", path="/mcp",
+             length=None):
+    """POST to /mcp. Returns (status, headers, parsed body or None)."""
+    data = body if body is not None else json.dumps(message).encode()
+    conn = ti.http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.putrequest("POST", path, skip_host=True)
+        conn.putheader("Host", host_header or f"localhost:{port}")
+        if content_type:
+            conn.putheader("Content-Type", content_type)
+        if length is not False:
+            conn.putheader("Content-Length", str(len(data) if length is None else length))
+        for key, value in (headers or {}).items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        if data and length is None:
+            conn.send(data)
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, dict(resp.getheaders()), (json.loads(raw) if raw else None)
+    finally:
+        conn.close()
+
+
+class OverHttp(ti.Api):
+    def post(self, message=None, **kw):
+        return post_mcp(self.port, message, **kw)
+
+    def result(self, method, version=NEWEST, request_id=1, **params):
+        status, headers, body = self.post(rpc(method, request_id, **params), headers={"MCP-Protocol-Version": version})
+        self.assertEqual(status, 200, body)
+        return body["result"]
+
+
+class TheHttpDoor(OverHttp):
+    def test_a_conversation(self):
+        self.devices(**{"kitchen-pi": dev(age=2)})
+        status, headers, body = self.post(rpc("initialize", 1, protocolVersion=NEWEST, capabilities={}))
+        self.assertEqual((status, body["result"]["protocolVersion"], body["id"]), (200, NEWEST, 1))
+        self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
+        self.assertNotIn("Mcp-Session-Id", headers, "nothing is remembered between requests, so there is no session")
+        status, _, empty = self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertEqual((status, empty), (202, None))
+        tools = self.result("tools/list")["tools"]
+        self.assertEqual({t["name"] for t in tools}, set(ti.REAL_FEATURES))
+        called = self.result("tools/call", name="list_devices", arguments={})
+        self.assertEqual(called["structuredContent"]["devices"][0]["device_id"], "kitchen-pi")
+        self.assertEqual(json.loads(called["content"][0]["text"]), called["structuredContent"])
+
+    def test_every_request_stands_alone(self):
+        """tools/list works with no initialize before it: there is no state to hold, and none to steal."""
+        self.assertEqual(len(self.result("tools/list")["tools"]), len(ti.REAL_FEATURES))
+        self.assertEqual(self.result("initialize", protocolVersion=NEWEST)["protocolVersion"], NEWEST)
+        self.assertEqual(self.result("initialize", protocolVersion=NEWEST)["protocolVersion"], NEWEST, "twice is fine")
+
+    def test_the_version_header_decides_what_the_answer_contains(self):
+        self.devices(a=dev())
+        newest = self.result("tools/call", name="stack_status", arguments={})
+        self.assertIn("structuredContent", newest)
+        status, _, body = self.post(rpc("tools/call", 2, name="stack_status", arguments={}))  # no header: assume 2025-03-26
+        self.assertNotIn("structuredContent", body["result"])
+        self.assertIn("annotations", self.result("tools/list", "2025-03-26")["tools"][0])
+        self.assertNotIn("outputSchema", self.result("tools/list", "2025-03-26")["tools"][0])
+
+    def test_an_unsupported_version_is_a_400_which_is_how_newer_clients_fall_back(self):
+        for version in ("2026-07-28", "1999-01-01", "latest"):
+            status, _, body = self.post(rpc("server/discover"), headers={"MCP-Protocol-Version": version})
+            self.assertEqual(status, 400, version)
+            self.assertIn("unsupported MCP-Protocol-Version", body["error"])
+
+    def test_what_is_not_offered_is_method_not_found(self):
+        status, _, body = self.post(rpc("server/discover"))
+        self.assertEqual((status, body["error"]["code"]), (200, mcp_server.METHOD_NOT_FOUND))
+
+    def test_bad_messages_are_refused_without_a_crash(self):
+        for raw in (b"not json", b"{", b'{"a": NaN}', b"\xff\xfe", b"[" * 100000):
+            status, _, body = self.post(body=raw)
+            self.assertEqual((status, body["error"]["code"]), (400, mcp_server.PARSE_ERROR), raw[:20])
+        status, _, body = self.post([rpc("ping")])  # a batch
+        self.assertEqual((status, body["error"]["code"]), (200, mcp_server.INVALID_REQUEST))
+        self.assertEqual(self.result("ping"), {}, "and the server is still fine")
+
+    def test_the_body_must_be_json_and_have_a_length_within_the_limit(self):
+        self.assertEqual(self.post(rpc("ping"), content_type="text/plain")[0], 415)
+        self.assertEqual(self.post(rpc("ping"), content_type=None)[0], 415)
+        self.assertEqual(self.post(rpc("ping"), length=False)[0], 411)
+        status, _, _ = self.post(body=b"", length=mcp_server.MAX_LINE + 1)  # claims too much: refused before reading it
+        self.assertEqual(status, 413)
+        self.assertEqual(self.result("ping"), {})
+
+    def test_a_web_page_is_refused_by_its_origin_header(self):
+        for origin in ("https://evil.example", "http://localhost.evil.com", "http://10.0.0.5:8765", "null"):
+            self.assertEqual(self.post(rpc("ping"), headers={"Origin": origin})[0], 403, origin)
+        for origin in ("http://localhost:6274", "http://127.0.0.1:3000"):
+            self.assertEqual(self.post(rpc("ping"), headers={"Origin": origin})[0], 200, origin)
+
+    def test_a_foreign_host_name_is_refused(self):
+        self.assertEqual(self.post(rpc("ping"), host_header="evil.example")[0], 403)
+
+    def test_it_takes_post_only_and_the_rest_of_the_api_still_does_not(self):
+        for method in ("GET", "DELETE", "PUT", "PATCH"):
+            status, headers, _ = self.request("/mcp", method=method)
+            self.assertEqual((status, headers["Allow"]), (405, "POST"), method)
+        status, headers, _ = self.post(rpc("ping"), path="/v1/list_devices")
+        self.assertEqual((status, headers["Allow"]), (405, "GET"))
+        self.assertEqual(self.post(rpc("ping"), path="/mcp/")[0], 200)
+
+    def test_the_two_doors_give_the_same_answer(self):
+        self.devices(up=dev(age=2), down=dev(age=900))
+        via_mcp = self.result("tools/call", name="list_devices", arguments={"state": "offline"})["structuredContent"]
+        _, _, via_api = self.request("/v1/list_devices?state=offline")
+        self.assertEqual(via_mcp, via_api)
+
+    def test_a_problem_is_an_error_result_not_a_failed_request(self):
+        result = self.result("tools/call", name="how_to_add_device", arguments={"kind": "usb"})
+        self.assertTrue(result["isError"])
+        self.assertIn("kind must be one of", result["content"][0]["text"])
+
+    def test_a_secret_is_never_sent_and_nothing_of_the_call_is_logged(self):
+        self.env(f"MQTT_PASSWORD={ti.SECRET}\n")
+        self.devices(**{"x": dev(host=ti.SECRET)})
+        result = self.result("tools/call", name="get_device", arguments={"device_id": "x"})
+        self.assertTrue(result["isError"])
+        self.assertNotIn(ti.SECRET, json.dumps(result))
+        self.result("tools/call", name="get_device", arguments={"device_id": "my-private-device-name"})
+        log = self.log.getvalue()
+        self.assertNotIn(ti.SECRET, log)
+        self.assertNotIn("my-private-device-name", log, "the body of a call is never logged")
+        self.assertIn('"POST /mcp" 200', log)
+
+
+class TheHttpDoorWithAToken(OverHttp):
+    token = "mcp-token-" + "q" * 20
+
+    def test_nothing_is_answered_without_the_token(self):
+        calls = []
+        with mock.patch.object(registry, "call", side_effect=lambda *a, **k: calls.append(a)):
+            for headers in (None, {"Authorization": "Bearer wrong"}, {"Authorization": self.token},
+                            {"Authorization": "Basic " + self.token}):
+                status, response_headers, body = self.post(rpc("tools/call", 1, name="stack_status"), headers=headers)
+                self.assertEqual(status, 401, headers)
+                self.assertEqual(response_headers["WWW-Authenticate"], "Bearer")
+            self.assertEqual(self.post(rpc("ping"), path=f"/mcp?token={self.token}")[0], 401, "not in the address")
+        self.assertEqual(calls, [], "no feature ran for any refused request")
+
+    def test_the_right_token_works(self):
+        status, _, body = self.post(rpc("ping"), headers={"Authorization": f"Bearer {self.token}"})
+        self.assertEqual((status, body["result"]), (200, {}))
+
+
+@unittest.skipUnless(HAVE_MCP, "the official 'mcp' package is not installed; it is only needed for these referee tests")
+class TheOfficialClientOverHttp(OverHttp):
+    token = "ref-token-" + "w" * 20
+
+    def connect(self, mode="auto", token=None, then=None):
+        import httpx2
+        from mcp import Client
+        from mcp.client.streamable_http import streamable_http_client
+
+        async def go():
+            http = httpx2.AsyncClient(headers={"Authorization": f"Bearer {token or self.token}"})
+            async with Client(streamable_http_client(f"http://127.0.0.1:{self.port}/mcp", http_client=http), mode=mode) as client:
+                return await then(client)
+        return asyncio.run(asyncio.wait_for(go(), 60))
+
+    def test_it_connects_in_both_modes_lists_and_calls(self):
+        self.devices(**{"kitchen-pi": dev(age=2)})
+
+        async def work(client):
+            tools = await client.list_tools()
+            ok = await client.call_tool("get_device", {"device_id": "kitchen-pi"})
+            bad = await client.call_tool("how_to_add_device", {"kind": "usb"})
+            return client.protocol_version, {t.name for t in tools.tools}, ok, bad
+        for mode in ("auto", "legacy"):
+            version, names, ok, bad = self.connect(mode, then=work)
+            self.assertEqual((version, names), (NEWEST, set(ti.REAL_FEATURES)), mode)
+            self.assertEqual(ok.structured_content["state"], "ONLINE", mode)
+            self.assertTrue(bad.is_error, mode)
+
+    def test_a_wrong_token_cannot_connect(self):
+        async def work(client):
+            return await client.list_tools()
+        with self.assertRaises(BaseException):
+            self.connect("legacy", token="not-the-token", then=work)
+
+
 if __name__ == "__main__":
     unittest.main()

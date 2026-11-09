@@ -10,7 +10,8 @@ from interface import fleetlink
 from interface.registry import FeatureError, feature
 
 VIA = {"agent": "the device agent", "mqtt": "MQTT", "checkin": "the check-in URL", "watcher": "being watched from the server"}
-STATES = ("all", "online", "offline")
+STATES = ("all", "online", "offline", "waiting")
+KIND_VIA = {"watch": "watcher"}  # a registered device's "way" as ./fleet names it, to the name used for reports_via
 KNOWN_LIMIT = 50  # how many device ids "not found" lists to help with a typo
 
 
@@ -51,8 +52,41 @@ def present(d):
         "disk_percent": _number(d["disk"]),
         "temperature_celsius": _number(d["temp"]),
         "uptime_seconds": _number(d["uptime"]),
+        "registered_at": None,
     }
 
+
+def present_waiting(w):
+    """A device that is expected (or watched) but has not reported: the same keys, nothing to show but when it was registered."""
+    out = {k: None for k in present({"device_id": "", "hostname": "", "state": "", "via": "", "last_seen": None, "age_seconds": None,
+                                      "offline_after": None, "report_interval": None, "cpu": None, "mem": None, "disk": None,
+                                      "temp": None, "uptime": None})}
+    out.update(device_id=w["device_id"], state="WAITING", reports_via=KIND_VIA.get(w["kind"], w["kind"]),
+               registered_at=_iso(w.get("added")))
+    return out
+
+
+def explain_waiting(w):
+    """Why a device is not shown yet and what finishes the setup."""
+    since = f"Registered {_duration(time.time() - w['added'])} ago" if w.get("added") else "Being watched"
+    asks = {
+        "agent": ["Run the device agent on the device (how_to_add_device with kind=agent gives the exact commands) and make "
+                  "sure it can reach the server on port 4317."],
+        "mqtt": ["A brand-new board has no software to report with yet: flash it first (how_to_add_device with kind=mqtt "
+                 "and firmware=micropython or firmware=arduino gives a ready sketch).",
+                 f"It must publish fleet/{w['device_id']}/uptime_seconds. On the server, `docker compose logs mqtt-bridge` "
+                 "shows what the bridge refused and why."],
+        "checkin": ["Run the check-in curl command on the device once (how_to_add_device with kind=checkin gives it, "
+                    "with this server's address)."],
+        "watch": ["The server has not got an answer from what it watches. `./fleet watch list` on the server shows what it "
+                  "tried; check the address, and that the target answers from the server's network."],
+    }
+    steps = list(asks.get(w["kind"], asks["agent"]))
+    steps.append(f"If you no longer expect it, a person can stop with `./fleet remove {w['device_id']}` on the server "
+                 "(this interface cannot do that).")
+    return {"explanation": f"{since} and has not reported in the last 24 hours, so it has no state yet. A device appears here as "
+                           "ONLINE or OFFLINE once it reports. No alert fires for a device that has never reported.",
+            "next_steps": steps}
 
 def explain(d):
     """What the state means for this device, in words, and what to try. Mirrors `./fleet check`."""
@@ -81,30 +115,42 @@ def explain(d):
 def list_devices(state: str = "all") -> dict:
     """List the devices that reported in the last 24 hours, with their state and latest readings.
 
-    state: "all" (the default), "online" or "offline". Readings are null where a device does not report them
-    (a check-in or MQTT device has no CPU, for example). Use get_device for one device in detail."""
+    state: "all" (the default), "online", "offline" or "waiting". WAITING is a device a person registered with
+    `./fleet add` (or a watched target) that has not reported yet, for example a brand-new board with no firmware: it
+    has no readings, only when it was registered. Readings are null where a device does not report them (a check-in
+    or MQTT device has no CPU, for example). Use get_device for one device in detail."""
     if state not in STATES:
         raise FeatureError(f"state must be one of: {', '.join(STATES)}")
     found = fleetlink.devices()
+    waiting, warning = fleetlink.waiting(found)
     online = sum(1 for d in found.values() if d["state"] == "ONLINE")
-    shown = [present(d) for d in found.values() if state == "all" or d["state"].lower() == state]
-    return {"count": len(shown), "online": online, "offline": len(found) - online, "devices": shown,
-            **({"note": "No device has reported in the last 24 hours. See how_to_add_device."} if not found else {})}
+    shown = [present(d) for d in found.values() if state in ("all", d["state"].lower())]
+    shown += [present_waiting(w) for w in waiting.values() if state in ("all", "waiting")]
+    out = {"count": len(shown), "online": online, "offline": len(found) - online, "waiting": len(waiting), "devices": shown}
+    if not found and not waiting:
+        out["note"] = "No device has reported in the last 24 hours. See how_to_add_device."
+    if warning:
+        out["warning"] = f"The list of expected devices could not be read, so waiting devices are not shown: {warning}"
+    return out
 
 
 @feature
 def get_device(device_id: str) -> dict:
     """One device in detail: its state, why, and what to try. Also the way to check that a device you just set up arrived.
 
-    device_id: the ID the device reports with. If it has not reported in the last 24 hours the answer is
-    found=false (not an error), together with the IDs that are known. A device that was only just set up can take
-    up to about 15 seconds to appear, so ask again if you have just started it."""
+    device_id: the ID the device reports with. State is ONLINE or OFFLINE once it has reported, and WAITING when it was
+    registered (`./fleet add`) but has not reported yet. An ID that is neither reporting nor registered is
+    found=false (not an error), together with the IDs that are known. A device that was only just set up can take up
+    to about 15 seconds to appear, so ask again if you have just started it."""
     found = fleetlink.devices()
     d = found.get(device_id)
-    if d is None:
-        known = sorted(found)
-        return {"found": False, "device_id": device_id,
-                "explanation": f"No device with this ID has reported in the last 24 hours. If you have only just set it "
-                               f"up, wait about 15 seconds and ask again. IDs are exact and lowercase.",
-                "known_devices": known[:KNOWN_LIMIT]}
-    return {"found": True, **present(d), **explain(d)}
+    if d is not None:
+        return {"found": True, **present(d), **explain(d)}
+    waiting, _ = fleetlink.waiting(found)
+    if device_id in waiting:
+        return {"found": True, **present_waiting(waiting[device_id]), **explain_waiting(waiting[device_id])}
+    known = sorted(set(found) | set(waiting))
+    return {"found": False, "device_id": device_id,
+            "explanation": "No device with this ID has reported in the last 24 hours, and none is registered under it. If "
+                           "you have only just set it up, wait about 15 seconds and ask again. IDs are exact and lowercase.",
+            "known_devices": known[:KNOWN_LIMIT]}

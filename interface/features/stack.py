@@ -26,6 +26,7 @@ def stack_status() -> dict:
     devices = None if found is None else {
         "online": sum(1 for d in found.values() if d["state"] == "ONLINE"),
         "offline": sum(1 for d in found.values() if d["state"] != "ONLINE"),
+        "waiting": len(fleetlink.waiting(found)[0]),
     }
     result = {
         "running": running,

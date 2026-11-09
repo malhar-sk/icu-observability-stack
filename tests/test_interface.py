@@ -41,7 +41,9 @@ class Isolated(unittest.TestCase):
                                     (fleet, "port_open", lambda host, port, timeout=2: False),
                                     (fleet, "grafana_healthy", lambda: False),
                                     (fleet, "lan_ip", lambda: "192.168.1.10"),
-                                    (fleet, "TARGETS_FILE", os.path.join(self.dir.name, "targets.json"))]:
+                                    (fleet, "TARGETS_FILE", os.path.join(self.dir.name, "targets.json")),
+                                    (fleet, "WATCH_DIR", self.dir.name),
+                                    (fleet, "EXPECTED_FILE", os.path.join(self.dir.name, "expected.json"))]:
             p = mock.patch.object(target, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -370,6 +372,84 @@ class OneDevice(WithStack):
         self.assertIn("15 seconds", out["explanation"])
 
 
+class WaitingDevices(WithStack):
+    """A device you registered with ./fleet add that has not reported yet (a brand-new board) is WAITING, not invisible."""
+
+    def expect(self, **devices):
+        fleet.write_expected({d: {"kind": kind, "added": int(__import__("time").time()) - 125} for d, kind in devices.items()})
+
+    def test_it_is_listed_with_the_same_keys_and_nothing_to_read(self):
+        self.expect(**{"new-board": "mqtt"})
+        self.devices(up=dev(age=2))
+        out = self.call("list_devices")
+        self.assertEqual((out["count"], out["online"], out["offline"], out["waiting"]), (2, 1, 0, 1))
+        board = next(d for d in out["devices"] if d["device_id"] == "new-board")
+        up = next(d for d in out["devices"] if d["device_id"] == "up")
+        self.assertEqual(set(board), set(up), "the same keys for every device, whatever its state")
+        self.assertEqual((board["state"], board["reports_via"], board["cpu_percent"], board["last_seen"]),
+                         ("WAITING", "mqtt", None, None))
+        self.assertRegex(board["registered_at"], r"^\d{4}-\d\d-\d\dT")
+        self.assertNotIn("note", out)
+
+    def test_the_filter_and_the_counts(self):
+        self.expect(**{"new-board": "agent"})
+        self.devices(up=dev(age=2), down=dev(age=900))
+        self.assertEqual([d["device_id"] for d in self.call("list_devices", state="waiting")["devices"]], ["new-board"])
+        for state, ids in (("online", ["up"]), ("offline", ["down"])):
+            out = self.call("list_devices", state=state)
+            self.assertEqual([d["device_id"] for d in out["devices"]], ids)
+            self.assertEqual(out["waiting"], 1, "the totals stay about everything")
+
+    def test_a_device_that_reports_stops_waiting(self):
+        self.expect(**{"board": "agent"})
+        self.assertEqual(self.call("list_devices")["waiting"], 1)
+        self.devices(board=dev(age=2))
+        out = self.call("list_devices")
+        self.assertEqual((out["waiting"], out["online"], out["devices"][0]["state"]), (0, 1, "ONLINE"))
+
+    def test_a_watched_target_that_never_answered_is_waiting_too(self):
+        fleet.write_targets([{"id": "router", "kind": "ping", "target": "10.0.0.1"}])
+        out = self.call("list_devices", state="waiting")
+        self.assertEqual([(d["device_id"], d["reports_via"], d["registered_at"]) for d in out["devices"]],
+                         [("router", "watcher", None)])
+        text = self.call("get_device", device_id="router")["explanation"]
+        self.assertIn("Being watched", text)
+
+    def test_get_device_explains_what_finishes_the_setup_for_each_way(self):
+        for kind, words in (("agent", "port 4317"), ("mqtt", "firmware=micropython"), ("mqtt", "uptime_seconds"),
+                            ("checkin", "check-in curl"), ("watch", "fleet watch list")):
+            self.expect(**{"board": kind})
+            out = self.call("get_device", device_id="board")
+            self.assertTrue(out["found"])
+            self.assertEqual(out["state"], "WAITING")
+            self.assertIn("Registered 2 min", out["explanation"])
+            self.assertIn("No alert fires for a device that has never reported", out["explanation"])
+            self.assertIn(words, " ".join(out["next_steps"]), kind)
+            self.assertIn("cannot do that", out["next_steps"][-1])
+
+    def test_an_unknown_id_still_is_not_found_and_the_known_list_includes_waiting_ones(self):
+        self.expect(**{"new-board": "agent"})
+        self.devices(up=dev())
+        out = self.call("get_device", device_id="nope")
+        self.assertFalse(out["found"])
+        self.assertEqual(out["known_devices"], ["new-board", "up"])
+        self.assertIn("none is registered", out["explanation"])
+
+    def test_an_unreadable_list_is_a_warning_and_the_rest_still_answers(self):
+        with open(fleet.EXPECTED_FILE, "w") as f:
+            f.write("nonsense")
+        self.devices(up=dev(age=2))
+        out = self.call("list_devices")
+        self.assertEqual((out["count"], out["waiting"]), (1, 0))
+        self.assertIn("could not be read", out["warning"])
+        self.assertTrue(self.call("get_device", device_id="up")["found"])
+
+    def test_status_counts_them(self):
+        self.expect(**{"a": "agent", "b": "mqtt"})
+        self.devices(up=dev(age=2))
+        self.assertEqual(self.call("stack_status")["devices"], {"online": 1, "offline": 0, "waiting": 2})
+
+
 class StackStatus(WithStack):
     def test_a_healthy_stack_with_inputs(self):
         self.env("COMPOSE_PROFILES=mqtt,checkin\nCHECKIN_PORT=8090\nMQTT_PASSWORD=" + SECRET + "\n")
@@ -380,7 +460,7 @@ class StackStatus(WithStack):
              mock.patch.object(fleet, "notify_configured", lambda: True):
             out = self.call("stack_status")
         self.assertTrue(out["running"])
-        self.assertEqual(out["devices"], {"online": 1, "offline": 1})
+        self.assertEqual(out["devices"], {"online": 1, "offline": 1, "waiting": 0})
         self.assertEqual(out["inputs"]["mqtt"]["broker"], "bundled")
         self.assertEqual((out["inputs"]["checkin_url"]["on"], out["inputs"]["checkin_url"]["port"]), (True, 8090))
         self.assertEqual(out["inputs"]["device_agent"]["endpoint"], "192.168.1.10:4317")

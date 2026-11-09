@@ -5,13 +5,16 @@ the machine hosting the stack). It never shows a password or key; the steps say 
 Keep it in line with README section 4 and the docs/*.md pages; tests/test_interface.py checks that every ./fleet
 command written here is a real command.
 """
+import os
+
 from interface import fleetlink
 from interface.registry import FeatureError, feature
 
 SECRET_NOTE = ("The password and key are in .env on the server, and `./fleet add` prints them for the person at the "
                "terminal. This interface never shows them.")
 VERIFY = {"where": "anywhere", "action": "Check that it arrived: call get_device with the device_id. ONLINE means it works. "
-                                         "A new device can take about 15 seconds to appear."}
+                                         "WAITING means it is registered but has not reported yet (a new device can take about "
+                                         "15 seconds; its next_steps say what finishes the setup)."}
 
 KINDS = {
     "agent": {
@@ -94,6 +97,40 @@ KINDS = {
 }
 
 
+# Ready-to-flash code for a brand-new board, kept as real files so tests can check them. {name: (file, language, steps, tested)}
+FIRMWARE = {
+    "micropython": (
+        "examples/esp32_micropython.py", "MicroPython (ESP32, Pico W)",
+        ["Install MicroPython on the board if it has none (the board's page on micropython.org explains how).",
+         "Copy the code below to the board as main.py (for example with Thonny or mpremote), then restart the board."],
+        "Its logic was run against stand-ins for MicroPython's libraries and a real broker's rules; it has not been run on a "
+        "real ESP32 or Pico W."),
+    "arduino": (
+        "examples/esp32_arduino/esp32_arduino.ino", "Arduino C++ (ESP32)",
+        ["In the Arduino IDE add the ESP32 board support and install the PubSubClient library.",
+         "Paste the code below into a new sketch, choose the board, and upload."],
+        "Only its syntax was checked, against a stand-in for the libraries. It was not compiled with the Arduino toolchain "
+        "and not run on a board."),
+}
+NEEDS_REPLACING = ["WIFI_SSID and WIFI_PASSWORD (your Wi-Fi)",
+                   "the MQTT password: it is THE-PASSWORD in the code; the real one is MQTT_PASSWORD in .env on the server "
+                   "(`./fleet add <id> --mqtt` prints it for the person at the terminal)",
+                   "read_temperature() / readTemperature(): your sensor, or leave it to send only the alive signal"]
+
+
+def firmware_for(name, device_id, endpoint):
+    """The template with this server's values put in. The password is never put in: it stays THE-PASSWORD."""
+    file, language, steps, tested = FIRMWARE[name]
+    with open(os.path.join(fleetlink.ROOT, file), encoding="utf-8") as f:
+        code = f.read()
+    code = (code.replace("REPLACE-DEVICE-ID", device_id or "REPLACE-DEVICE-ID")
+                .replace("REPLACE-BROKER-ADDRESS", endpoint["host"] or "REPLACE-BROKER-ADDRESS")
+                .replace("REPLACE-MQTT-USER", endpoint["user"] or "REPLACE-MQTT-USER")
+                .replace("PORT = 1883", f"PORT = {endpoint['port']}"))
+    return {"language": language, "file": file, "flash_steps": steps, "code": code, "still_to_fill_in": NEEDS_REPLACING,
+            "tested": tested}
+
+
 def fill(text, device_id, address, checkin_port):
     """Put the real values into a command; leave a placeholder where nothing is known."""
     return (text.replace("<device_id>", device_id or "<device_id>")
@@ -102,16 +139,23 @@ def fill(text, device_id, address, checkin_port):
 
 
 @feature
-def how_to_add_device(kind: str = "", device_id: str = "") -> dict:
+def how_to_add_device(kind: str = "", device_id: str = "", firmware: str = "") -> dict:
     """The steps to add a device, for one of four ways: "agent", "mqtt", "checkin" or "watch".
 
     kind: leave empty to list the four ways and when each fits; or name one for its exact steps.
     device_id: optional. If given, the commands come filled in with it (lowercase letters, digits, '.', '_', '-').
+    firmware: optional, for a brand-new board with no software yet: "micropython" or "arduino" adds ready-to-flash code
+    for kind "mqtt" with this server's address and your device_id filled in (a board has to be flashed before it can report).
     Steps marked "server" are run on the machine that hosts the stack by a person or an assistant with a shell there;
     this tool only explains, and cannot run anything. Passwords and keys are never shown."""
     rule = fleetlink.device_id_rule()
     if device_id and not fleetlink.fleet().is_valid_device_id(device_id):
         raise FeatureError(f"device_id must be {rule['plain']}")
+    if firmware and firmware not in FIRMWARE:
+        raise FeatureError(f"firmware must be one of: {', '.join(FIRMWARE)}")
+    if firmware and kind not in ("", "mqtt"):
+        raise FeatureError("firmware is only for kind=mqtt (a board that reports over MQTT)")
+    kind = kind or ("mqtt" if firmware else "")
     if not kind:
         return {"ways": {k: {"title": v["title"], "use_when": v["use_when"]} for k, v in KINDS.items()},
                 "device_id_rule": rule["plain"],
@@ -129,6 +173,8 @@ def how_to_add_device(kind: str = "", device_id: str = "") -> dict:
               "docs": guide["docs"], "device_id_rule": rule["plain"]}
     if kind == "mqtt":
         result["mqtt_is_on"] = state["mqtt"]["mode"] is not None
+        if firmware:
+            result["firmware"] = firmware_for(firmware, device_id, fleetlink.mqtt_endpoint())
     if kind == "checkin":
         result["checkin_is_on"] = state["checkin"]["enabled"]
     return result

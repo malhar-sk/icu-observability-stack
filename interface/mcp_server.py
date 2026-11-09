@@ -102,11 +102,19 @@ def error_response(request_id, code, message):
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-class Protocol:
-    """One client connection. handle(message) takes a decoded JSON message and returns the response to send, or None."""
+STATELESS_DEFAULT = "2025-03-26"  # what a request over HTTP is taken to speak when it names no version (the spec's rule)
 
-    def __init__(self):
-        self.version = None  # set when initialize succeeds
+
+class Protocol:
+    """One client connection. handle(message) takes a decoded JSON message and returns the response to send, or None.
+
+    Over stdio one Protocol lives as long as the connection and insists on initialize first. Over HTTP (interface/http_api.py)
+    every request stands alone, so a Protocol is made per request with stateless=True and the version the client named:
+    nothing is remembered between requests, and there is no session to hijack."""
+
+    def __init__(self, stateless=False, version=None):
+        self.stateless = stateless
+        self.version = (version or STATELESS_DEFAULT) if stateless else None  # stdio: set when initialize succeeds
 
     def handle(self, message):
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
@@ -146,14 +154,14 @@ class Protocol:
             return self.initialize(params)
         if method not in ("tools/list", "tools/call"):
             raise RpcError(METHOD_NOT_FOUND, f"method not found: {method}")  # includes server/discover: clients fall back
-        if self.version is None:
+        if self.version is None:  # (never true when stateless)
             raise RpcError(INVALID_REQUEST, "send initialize first")
         if method == "tools/list":
             return {"tools": [describe_tool(f, self.version) for f in registry.enabled()]}
         return self.call_tool(params)
 
     def initialize(self, params):
-        if self.version is not None:
+        if self.version is not None and not self.stateless:
             raise RpcError(INVALID_REQUEST, "already initialized")
         asked = params.get("protocolVersion")
         if not isinstance(asked, str):

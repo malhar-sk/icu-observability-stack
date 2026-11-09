@@ -24,6 +24,7 @@ fleet = importlib.util.module_from_spec(_spec)
 _loader.exec_module(fleet)
 _TMP = tempfile.mkdtemp(prefix="fleet-test-")
 fleet.ENV_FILE = os.path.join(_TMP, ".env")  # never read (or write) a real .env
+fleet.EXPECTED_FILE = os.path.join(_TMP, "expected.json")  # nor the real list of expected devices
 
 
 def run(argv):
@@ -117,6 +118,14 @@ class WithFakeVM(unittest.TestCase):
     def setUp(self):
         FakeVM.state = {"healthy": True, "devices": {}, "queries": [], "deleted": [],
                         "age_queries": 0, "hide_until_query": 0, "cache_reset": False}
+        self._expected_dir = tempfile.TemporaryDirectory()  # a fresh list of expected devices for every test
+        self.addCleanup(self._expected_dir.cleanup)
+        watch_dir = os.path.join(self._expected_dir.name, "watch")
+        for name, value in (("EXPECTED_FILE", os.path.join(self._expected_dir.name, "expected.json")),
+                            ("WATCH_DIR", watch_dir), ("TARGETS_FILE", os.path.join(watch_dir, "targets.json"))):
+            e = mock.patch.object(fleet, name, value)  # never touch the real lists of expected or watched devices
+            e.start()
+            self.addCleanup(e.stop)
         p = mock.patch.object(fleet, "VM_URL", self.url)
         p.start()
         self.addCleanup(p.stop)
